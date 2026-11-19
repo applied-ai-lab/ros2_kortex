@@ -13,16 +13,18 @@
 // limitations under the License.
 
 // Soft stop from a ROS topic: the arm's own emergency stop, engaged and released by a std_msgs/Bool
-// topic (hardware parameter `soft_stop_topic`; true = stop, false = release). This replaces the ROS 1
-// kortex_driver's /in/emergency_stop and /in/clear_faults topics, which a ros2_control plugin cannot offer.
+// topic (hardware parameter `soft_stop_topic`; true = stop, false = release). This replaces the
+// ROS 1 kortex_driver's /in/emergency_stop and /in/clear_faults topics, which a ros2_control
+// plugin cannot offer.
 //
-// Watchdog (hardware parameter soft_stop_watchdog, default on): silence on the topic for longer than
-// soft_stop_timeout_s counts as a stop, so a soft stop that dies, or a lost network, stops the arm. The
-// publisher must therefore send its state periodically (a heartbeat; Frank's soft stop does, at 10 Hz).
+// Watchdog (hardware parameter soft_stop_watchdog, default on): silence on the topic for longer
+// than soft_stop_timeout_s counts as a stop, so a soft stop that dies, or a lost network, stops the
+// arm. The publisher must therefore send its state periodically (a heartbeat; Frank's soft stop
+// does, at 10 Hz).
 //
-// Threading: the subscription callback (the controller manager's executor, not real time) only stores the
-// requested state in an atomic; the real-time write() polls SoftStopLatch and performs the Kortex calls
-// (ApplyEmergencyStop on engage, ClearFaults on release) once per change.
+// Threading: the subscription callback (the controller manager's executor, not real time) only
+// stores the requested state in an atomic; the real-time write() polls SoftStopLatch and performs
+// the Kortex calls (ApplyEmergencyStop on engage, ClearFaults on release) once per change.
 
 #ifndef KORTEX_DRIVER__SOFT_STOP_HPP_
 #define KORTEX_DRIVER__SOFT_STOP_HPP_
@@ -38,17 +40,19 @@
 namespace kortex_driver
 {
 
-/// What the soft stop wants from the arm. ROS-free and lock-free: safe to use from the real-time loop.
+/// What the soft stop wants from the arm. ROS-free and lock-free: safe to use from the real-time
+/// loop.
 ///
-/// - Engage once when a stop is requested and not yet engaged; Release once when the stop is lifted.
+/// - Engage once when a stop is requested and not yet engaged; Release once when the stop is
+///   lifted.
 /// - Repeated messages (a soft stop republishing its state at 10 Hz) cause no further action.
 /// - No message ever received: nothing happens (the topic is optional and starts unknown).
-/// - After an engage, `holding()` stays true, also after release, until a controller switch: the arm
-///   keeps its measured position instead of following controller commands, so a trajectory that kept
-///   running during the stop can't make the arm jump when the stop is lifted.
+/// - After an engage, `holding()` stays true, also after release, until a controller switch: the
+///   arm keeps its measured position instead of following controller commands, so a trajectory that
+///   kept running during the stop can't make the arm jump when the stop is lifted.
 /// - A failed Kortex call (`mark_failed()`) is retried after `retry_cycles` polls, not every cycle.
-/// - Watchdog (`enable_watchdog(timeout)`, then `start(now)` on activation): no message for longer than
-///   `timeout` since the last message (or since start) counts as a stop request.
+/// - Watchdog (`enable_watchdog(timeout)`, then `start(now)` on activation): no message for longer
+///   than `timeout` since the last message (or since start) counts as a stop request.
 class SoftStopLatch
 {
 public:
@@ -130,8 +134,8 @@ public:
   /// The Kortex call for the last action failed: try again after retry_cycles polls.
   void mark_failed() { backoff_ = retry_cycles_; }
 
-  /// A controller switch happened (perform_command_mode_switch): controllers may command again, unless
-  /// the stop is still engaged or requested.
+  /// A controller switch happened (perform_command_mode_switch): controllers may command again,
+  /// unless the stop is still engaged or requested.
   void on_controller_switch(Clock::time_point now = Clock::now())
   {
     if (!engaged_ && !stop_wanted(now))
@@ -161,9 +165,9 @@ private:
   std::atomic<int64_t> last_message_ns_{0};
 };
 
-/// Subscribe `latch` to a std_msgs/Bool soft-stop topic (true = stop). Reliable and transient local, so the
-/// latest state of a latched publisher (e.g. Frank's /frank/soft_stop) arrives even if it was published
-/// before this subscription existed.
+/// Subscribe `latch` to a std_msgs/Bool soft-stop topic (true = stop). Reliable and transient
+/// local, so the latest state of a latched publisher (e.g. Frank's /frank/soft_stop) arrives even
+/// if it was published before this subscription existed.
 rclcpp::SubscriptionBase::SharedPtr subscribe_soft_stop(
   rclcpp::Node & node, const std::string & topic, SoftStopLatch & latch);
 

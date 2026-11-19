@@ -292,15 +292,17 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     RCLCPP_INFO(LOGGER, "Using internal bus communication for gripper!");
   }
 
-  // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false = release
-  // it). The subscription lives on this component's node, spun by the controller manager's executor.
+  // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false =
+  // release it). The subscription lives on this component's node, spun by the controller manager's
+  // executor.
   const auto soft_stop_param = info_.hardware_parameters.find("soft_stop_topic");
   if (soft_stop_param != info_.hardware_parameters.end() && !soft_stop_param->second.empty())
   {
     auto node = get_node();
     if (!node)
     {
-      RCLCPP_ERROR(LOGGER, "soft_stop_topic is set, but this component has no node to subscribe with");
+      RCLCPP_ERROR(
+        LOGGER, "soft_stop_topic is set, but this component has no node to subscribe with");
       return CallbackReturn::ERROR;
     }
     // Watchdog (default on): silence for longer than soft_stop_timeout_s (default 0.5 s) is a stop.
@@ -331,14 +333,15 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
         RCLCPP_ERROR(LOGGER, "soft_stop_timeout_s must be a positive number of seconds");
         return CallbackReturn::ERROR;
       }
-      soft_stop_.enable_watchdog(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(timeout_s)));
+      soft_stop_.enable_watchdog(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(timeout_s)));
     }
     soft_stop_subscription_ = subscribe_soft_stop(*node, soft_stop_param->second, soft_stop_);
     const std::string watchdog_info =
       soft_stop_.watchdog() ? "on, timeout " + std::to_string(timeout_s) + " s" : "off";
     RCLCPP_INFO(
-      LOGGER, "Soft stop: '%s' (std_msgs/Bool, true = emergency stop, false = release), watchdog %s",
+      LOGGER,
+      "Soft stop: '%s' (std_msgs/Bool, true = emergency stop, false = release), watchdog %s",
       soft_stop_param->second.c_str(), watchdog_info.c_str());
   }
 
@@ -929,7 +932,8 @@ return_type KortexMultiInterfaceHardware::write(
 
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_ && soft_stop_.engaged())
   {
-    // the fault reset would also clear the soft stop's emergency stop: only releasing the soft stop may
+    // the fault reset would also clear the soft stop's emergency stop: only releasing the soft
+    // stop may do that
     RCLCPP_ERROR(LOGGER, "Fault reset refused: the soft stop is engaged (release it first)");
     reset_fault_async_success_ = 0.0;
     reset_fault_cmd_ = NO_CMD;

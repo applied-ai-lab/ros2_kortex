@@ -221,7 +221,8 @@ private:
   double in_fault_;
   static constexpr double NO_CMD = std::numeric_limits<double>::quiet_NaN();
 
-  // soft stop from a topic (hardware parameter soft_stop_topic, std_msgs/Bool, true = stop; empty = off)
+  // soft stop from a topic (hardware parameter soft_stop_topic, std_msgs/Bool, true = stop;
+  // empty = off)
   SoftStopLatch soft_stop_;
   rclcpp::SubscriptionBase::SharedPtr soft_stop_subscription_;
   // write(): engage/release the arm's emergency stop when the soft stop changes (true = done)

@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Soft stop without an arm: SoftStopLatch (what write() does on each cycle, including the watchdog) and the
-// topic subscription (QoS compatible with a latched publisher such as Frank's /frank/soft_stop).
+// Soft stop without an arm: SoftStopLatch (what write() does on each cycle, including the watchdog)
+// and the topic subscription (QoS compatible with a latched publisher such as Frank's
+// /frank/soft_stop).
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
-#include <unistd.h>
 
 #include "kortex_driver/soft_stop.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -167,7 +168,7 @@ TEST(SoftStopWatchdog, LostHeartbeatEngagesAndResumingReleases)
   SoftStopLatch latch;
   watch(latch);
   latch.request(false, T0 + milliseconds(100));
-  EXPECT_EQ(latch.poll(T0 + milliseconds(500)), Action::None);  // 400 ms silent: still fine
+  EXPECT_EQ(latch.poll(T0 + milliseconds(500)), Action::None);    // 400 ms silent: still fine
   ASSERT_EQ(latch.poll(T0 + milliseconds(700)), Action::Engage);  // 600 ms silent: stop
   latch.mark_engaged();
   EXPECT_EQ(latch.poll(T0 + milliseconds(800)), Action::None);
@@ -189,7 +190,8 @@ TEST(SoftStopWatchdog, StopStaysEngagedWhenTheStopMessageStops)
   latch.request(true, T0 + milliseconds(100));
   ASSERT_EQ(latch.poll(T0 + milliseconds(110)), Action::Engage);
   latch.mark_engaged();
-  EXPECT_EQ(latch.poll(T0 + milliseconds(5000)), Action::None);  // silence while stopped: stays stopped
+  EXPECT_EQ(
+    latch.poll(T0 + milliseconds(5000)), Action::None);  // silence while stopped: stays stopped
   EXPECT_TRUE(latch.engaged());
 }
 
