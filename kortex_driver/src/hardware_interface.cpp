@@ -303,10 +303,43 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
       RCLCPP_ERROR(LOGGER, "soft_stop_topic is set, but this component has no node to subscribe with");
       return CallbackReturn::ERROR;
     }
+    // Watchdog (default on): silence for longer than soft_stop_timeout_s (default 0.5 s) is a stop.
+    const auto param = [this](const std::string & name, const std::string & fallback)
+    {
+      const auto it = info_.hardware_parameters.find(name);
+      return (it == info_.hardware_parameters.end() || it->second.empty()) ? fallback : it->second;
+    };
+    const std::string watchdog = param("soft_stop_watchdog", "true");
+    if (watchdog != "true" && watchdog != "True" && watchdog != "false" && watchdog != "False")
+    {
+      RCLCPP_ERROR(LOGGER, "soft_stop_watchdog must be true or false, not '%s'", watchdog.c_str());
+      return CallbackReturn::ERROR;
+    }
+    double timeout_s = 0.0;
+    try
+    {
+      timeout_s = std::stod(param("soft_stop_timeout_s", "0.5"));
+    }
+    catch (const std::exception &)
+    {
+      timeout_s = 0.0;
+    }
+    if (watchdog == "true" || watchdog == "True")
+    {
+      if (!(timeout_s > 0.0))
+      {
+        RCLCPP_ERROR(LOGGER, "soft_stop_timeout_s must be a positive number of seconds");
+        return CallbackReturn::ERROR;
+      }
+      soft_stop_.enable_watchdog(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(timeout_s)));
+    }
     soft_stop_subscription_ = subscribe_soft_stop(*node, soft_stop_param->second, soft_stop_);
+    const std::string watchdog_info =
+      soft_stop_.watchdog() ? "on, timeout " + std::to_string(timeout_s) + " s" : "off";
     RCLCPP_INFO(
-      LOGGER, "Soft stop: '%s' (std_msgs/Bool, true = emergency stop, false = release)",
-      soft_stop_param->second.c_str());
+      LOGGER, "Soft stop: '%s' (std_msgs/Bool, true = emergency stop, false = release), watchdog %s",
+      soft_stop_param->second.c_str(), watchdog_info.c_str());
   }
 
   RCLCPP_INFO(LOGGER, "Hardware Interface successfully configured");
@@ -726,6 +759,8 @@ CallbackReturn KortexMultiInterfaceHardware::on_activate(
   const rclcpp_lifecycle::State & /* previous_state */)
 {
   RCLCPP_INFO(LOGGER, "Activating KortexMultiInterfaceHardware...");
+  // the soft stop watchdog's first deadline counts from activation
+  soft_stop_.start();
   // first read
   auto base_feedback = base_cyclic_.RefreshFeedback();
 
@@ -1023,7 +1058,14 @@ void KortexMultiInterfaceHardware::handleSoftStop()
       if (applyEmergencyStop())
       {
         soft_stop_.mark_engaged();
-        RCLCPP_WARN(LOGGER, "Soft stop: emergency stop applied");
+        if (soft_stop_.timed_out())
+        {
+          RCLCPP_ERROR(LOGGER, "Soft stop watchdog: no message in time, emergency stop applied");
+        }
+        else
+        {
+          RCLCPP_WARN(LOGGER, "Soft stop: emergency stop applied");
+        }
       }
       else
       {

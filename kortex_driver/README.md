@@ -21,8 +21,16 @@ soft stop published on a ROS topic, as the ROS 1 driver did with `/in/emergency_
   <plugin>kortex_driver/KortexMultiInterfaceHardware</plugin>
   ...
   <param name="soft_stop_topic">/frank/soft_stop</param>
+  <param name="soft_stop_watchdog">true</param>     <!-- optional, default true -->
+  <param name="soft_stop_timeout_s">0.5</param>     <!-- optional, default 0.5 -->
 </hardware>
 ```
+
+| parameter | default | |
+|---|---|---|
+| `soft_stop_topic` | (empty = off) | `std_msgs/Bool` topic, true = stop |
+| `soft_stop_watchdog` | `true` | silence on the topic counts as a stop |
+| `soft_stop_timeout_s` | `0.5` | watchdog timeout [s]; the publisher must send its state more often (a heartbeat) |
 
 | message on the topic (`std_msgs/Bool`) | the driver |
 |---|---|
@@ -42,5 +50,9 @@ soft stop published on a ROS topic, as the ROS 1 driver did with `/in/emergency_
 - A failed Kortex call is logged and retried after 100 control cycles.
 - The callback only stores the requested state; the Kortex calls happen in `write()` (as the fault reset).
   `ApplyEmergencyStop`/`ClearFaults` are blocking TCP calls, so the cycle in which they run is late.
-- Silence on the topic does nothing; a publisher that must stop the arm on its own failure should publish
-  `true` (or a watchdog should).
+- **Watchdog** (`soft_stop_watchdog`, default on): if no message arrives for longer than
+  `soft_stop_timeout_s`, the driver applies the emergency stop, as if `true` had been received. The first
+  deadline counts from activation, so the soft stop must be running (publishing) for the arm to move. The
+  publisher must therefore republish its state periodically: a heartbeat (Frank's soft stop publishes every
+  0.1 s, so 0.5 s tolerates four lost messages). When messages resume with `false`, the stop is released as
+  above (faults cleared, arm holds until a controller switch). With the watchdog off, silence does nothing.

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Soft stop without an arm: SoftStopLatch (what write() does on each cycle) and the topic subscription
-// (QoS compatible with a latched publisher such as Frank's /frank/soft_stop).
+// Soft stop without an arm: SoftStopLatch (what write() does on each cycle, including the watchdog) and the
+// topic subscription (QoS compatible with a latched publisher such as Frank's /frank/soft_stop).
 
 #include <gtest/gtest.h>
 
@@ -122,6 +122,83 @@ TEST(SoftStopLatch, StopAndReleaseBetweenTwoCyclesDoesNothing)
   latch.request(true);
   latch.request(false);
   EXPECT_EQ(latch.poll(), Action::None);
+}
+
+// ----------------------------------------------------------------------------------- watchdog
+
+namespace
+{
+using std::chrono::milliseconds;
+const SoftStopLatch::Clock::time_point T0{std::chrono::seconds(1000)};
+
+void watch(SoftStopLatch & latch)  // watchdog 500 ms, started at T0
+{
+  latch.enable_watchdog(milliseconds(500));
+  latch.start(T0);
+}
+}  // namespace
+
+TEST(SoftStopWatchdog, SilenceSinceStartEngages)
+{
+  // the soft stop never published (not running): fail-safe stop once the timeout passes
+  SoftStopLatch latch;
+  latch.enable_watchdog(milliseconds(500));
+  latch.start(T0);
+  EXPECT_EQ(latch.poll(T0 + milliseconds(400)), Action::None);
+  EXPECT_FALSE(latch.timed_out(T0 + milliseconds(400)));
+  EXPECT_TRUE(latch.timed_out(T0 + milliseconds(600)));
+  EXPECT_EQ(latch.poll(T0 + milliseconds(600)), Action::Engage);
+}
+
+TEST(SoftStopWatchdog, HeartbeatKeepsTheArmRunning)
+{
+  SoftStopLatch latch;
+  watch(latch);
+  for (int i = 1; i <= 50; ++i)  // "released" every 100 ms for 5 s
+  {
+    latch.request(false, T0 + milliseconds(100 * i));
+    EXPECT_EQ(latch.poll(T0 + milliseconds(100 * i + 50)), Action::None);
+  }
+  EXPECT_FALSE(latch.engaged());
+}
+
+TEST(SoftStopWatchdog, LostHeartbeatEngagesAndResumingReleases)
+{
+  SoftStopLatch latch;
+  watch(latch);
+  latch.request(false, T0 + milliseconds(100));
+  EXPECT_EQ(latch.poll(T0 + milliseconds(500)), Action::None);  // 400 ms silent: still fine
+  ASSERT_EQ(latch.poll(T0 + milliseconds(700)), Action::Engage);  // 600 ms silent: stop
+  latch.mark_engaged();
+  EXPECT_EQ(latch.poll(T0 + milliseconds(800)), Action::None);
+  latch.on_controller_switch(T0 + milliseconds(800));
+  EXPECT_TRUE(latch.holding());  // no un-holding while timed out
+
+  latch.request(false, T0 + milliseconds(900));  // the soft stop is back, released
+  ASSERT_EQ(latch.poll(T0 + milliseconds(950)), Action::Release);
+  latch.mark_released();
+  EXPECT_TRUE(latch.holding());  // holds until a controller is re-activated
+  latch.on_controller_switch(T0 + milliseconds(960));
+  EXPECT_FALSE(latch.holding());
+}
+
+TEST(SoftStopWatchdog, StopStaysEngagedWhenTheStopMessageStops)
+{
+  SoftStopLatch latch;
+  watch(latch);
+  latch.request(true, T0 + milliseconds(100));
+  ASSERT_EQ(latch.poll(T0 + milliseconds(110)), Action::Engage);
+  latch.mark_engaged();
+  EXPECT_EQ(latch.poll(T0 + milliseconds(5000)), Action::None);  // silence while stopped: stays stopped
+  EXPECT_TRUE(latch.engaged());
+}
+
+TEST(SoftStopWatchdog, OffMeansSilenceDoesNothing)
+{
+  SoftStopLatch latch;  // no enable_watchdog()
+  latch.start(T0);
+  EXPECT_FALSE(latch.timed_out(T0 + std::chrono::hours(1)));
+  EXPECT_EQ(latch.poll(T0 + std::chrono::hours(1)), Action::None);
 }
 
 // --------------------------------------------------------------------------------- subscription
