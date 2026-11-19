@@ -2,13 +2,12 @@ name: Jazzy Binary Build
 on:
   pull_request:
     branches:
-      # try to keep jazzy and rolling(main) in sync
-      - jazzy
-      - main
+      # applied-ai-lab fork: our working branch is frank (upstream: jazzy, main)
+      - frank
   push:
     branches:
-      - jazzy
-      - main
+      - frank
+  workflow_dispatch:
   schedule:
     # Run every morning to detect flakiness and broken dependencies
     - cron: '13 4 * * *'
@@ -34,7 +33,7 @@ jobs:
       BASEDIR: ${{ github.workspace }}/.work
       CACHE_PREFIX: ${{ matrix.env.ROS_DISTRO }}-${{ matrix.env.ROS_REPO }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       # The target directory cache doesn't include the source directory because
       # that comes from the checkout.  See "prepare target_ws for cache" task below
       - name: cache target_ws
