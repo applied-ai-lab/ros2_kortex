@@ -41,6 +41,7 @@
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 
+#include "kortex_driver/soft_stop.hpp"
 #include "kortex_driver/visibility_control.h"
 
 #include "ActuatorConfigClientRpc.h"
@@ -219,6 +220,14 @@ private:
   double reset_fault_async_success_;
   double in_fault_;
   static constexpr double NO_CMD = std::numeric_limits<double>::quiet_NaN();
+
+  // soft stop from a topic (hardware parameter soft_stop_topic, std_msgs/Bool, true = stop; empty = off)
+  SoftStopLatch soft_stop_;
+  rclcpp::SubscriptionBase::SharedPtr soft_stop_subscription_;
+  // write(): engage/release the arm's emergency stop when the soft stop changes (true = done)
+  void handleSoftStop();
+  bool applyEmergencyStop();
+  bool clearFaultsAndRestoreServoing();
 
   void sendTwistCommand();
   void incrementId();

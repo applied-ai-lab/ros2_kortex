@@ -292,6 +292,23 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     RCLCPP_INFO(LOGGER, "Using internal bus communication for gripper!");
   }
 
+  // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false = release
+  // it). The subscription lives on this component's node, spun by the controller manager's executor.
+  const auto soft_stop_param = info_.hardware_parameters.find("soft_stop_topic");
+  if (soft_stop_param != info_.hardware_parameters.end() && !soft_stop_param->second.empty())
+  {
+    auto node = get_node();
+    if (!node)
+    {
+      RCLCPP_ERROR(LOGGER, "soft_stop_topic is set, but this component has no node to subscribe with");
+      return CallbackReturn::ERROR;
+    }
+    soft_stop_subscription_ = subscribe_soft_stop(*node, soft_stop_param->second, soft_stop_);
+    RCLCPP_INFO(
+      LOGGER, "Soft stop: '%s' (std_msgs/Bool, true = emergency stop, false = release)",
+      soft_stop_param->second.c_str());
+  }
+
   RCLCPP_INFO(LOGGER, "Hardware Interface successfully configured");
   return CallbackReturn::SUCCESS;
 }
@@ -697,6 +714,9 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
   start_modes_.clear();
   stop_modes_.clear();
 
+  // after a soft stop is released the arm holds until the operator switches controllers
+  soft_stop_.on_controller_switch();
+
   block_write = false;
 
   return ret_val;
@@ -870,6 +890,16 @@ return_type KortexMultiInterfaceHardware::write(
     return return_type::OK;
   }
 
+  handleSoftStop();
+
+  if (!std::isnan(reset_fault_cmd_) && fault_controller_running_ && soft_stop_.engaged())
+  {
+    // the fault reset would also clear the soft stop's emergency stop: only releasing the soft stop may
+    RCLCPP_ERROR(LOGGER, "Fault reset refused: the soft stop is engaged (release it first)");
+    reset_fault_async_success_ = 0.0;
+    reset_fault_cmd_ = NO_CMD;
+  }
+
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_)
   {
     try
@@ -913,8 +943,8 @@ return_type KortexMultiInterfaceHardware::write(
   {
     if (arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING)
     {
-      // Twist controller active
-      if (twist_controller_running_)
+      // Twist controller active (not while holding after a soft stop: no twist command = no motion)
+      if (twist_controller_running_ && !soft_stop_.holding())
       {
         // twist control
         sendTwistCommand();
@@ -926,8 +956,11 @@ return_type KortexMultiInterfaceHardware::write(
       }
 
       // gripper control
-      sendGripperCommand(
-        arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
+      if (!soft_stop_.holding())
+      {
+        sendGripperCommand(
+          arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
+      }
       // read after write in twist mode
       feedback_ = base_cyclic_.RefreshFeedback();
     }
@@ -938,11 +971,20 @@ return_type KortexMultiInterfaceHardware::write(
       // Per joint controller active
 
       // gripper control
-      sendGripperCommand(
-        arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
+      if (!soft_stop_.holding())
+      {
+        sendGripperCommand(
+          arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
+      }
 
       if (joint_based_controller_running_)
       {
+        if (soft_stop_.holding())
+        {
+          // hold the measured position instead of the controller's command (see SoftStopLatch)
+          arm_commands_positions_ = arm_positions_;
+          std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+        }
         // send commands to the joints
         sendJointCommands();
       }
@@ -971,6 +1013,86 @@ return_type KortexMultiInterfaceHardware::write(
   }
 
   return return_type::OK;
+}
+
+void KortexMultiInterfaceHardware::handleSoftStop()
+{
+  switch (soft_stop_.poll())
+  {
+    case SoftStopLatch::Action::Engage:
+      if (applyEmergencyStop())
+      {
+        soft_stop_.mark_engaged();
+        RCLCPP_WARN(LOGGER, "Soft stop: emergency stop applied");
+      }
+      else
+      {
+        soft_stop_.mark_failed();
+      }
+      break;
+    case SoftStopLatch::Action::Release:
+      if (clearFaultsAndRestoreServoing())
+      {
+        soft_stop_.mark_released();
+        RCLCPP_WARN(
+          LOGGER,
+          "Soft stop released: faults cleared; the arm holds until a controller is (re)activated");
+      }
+      else
+      {
+        soft_stop_.mark_failed();
+      }
+      break;
+    case SoftStopLatch::Action::None:
+      break;
+  }
+}
+
+bool KortexMultiInterfaceHardware::applyEmergencyStop()
+{
+  try
+  {
+    // twice, as in the fault reset: calling it once appeared to be unreliable (detected by testing)
+    base_.ApplyEmergencyStop(0, {false, 0, 100});
+    base_.ApplyEmergencyStop(0, {false, 0, 100});
+    return true;
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM(LOGGER, "Soft stop: ApplyEmergencyStop failed: " << ex.what());
+  }
+  catch (...)
+  {
+    RCLCPP_ERROR(LOGGER, "Soft stop: ApplyEmergencyStop failed");
+  }
+  return false;
+}
+
+bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
+{
+  try
+  {
+    servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
+    base_.SetServoingMode(servoing_mode_hw_);
+    base_.ClearFaults();
+    if (
+      arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING ||
+      arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING)
+    {
+      servoing_mode_hw_.set_servoing_mode(arm_mode_);
+      base_.SetServoingMode(servoing_mode_hw_);
+    }
+    return true;
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM(LOGGER, "Soft stop: clearing faults failed: " << ex.what());
+  }
+  catch (...)
+  {
+    RCLCPP_ERROR(LOGGER, "Soft stop: clearing faults failed");
+  }
+  return false;
 }
 
 void KortexMultiInterfaceHardware::prepareCommands()
