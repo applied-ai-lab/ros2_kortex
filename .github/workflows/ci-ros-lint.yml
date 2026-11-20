@@ -5,7 +5,7 @@ on:
 jobs:
   ament_lint:
     name: ament_${{ matrix.linter }}
-    runs-on: ubuntu-22.04  # Updated to match your Ubuntu version bump
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -13,11 +13,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - uses: ros-tooling/setup-ros@v0.7
-    - name: Set environment variable for cppcheck 2.7
+    - name: Allow the slow cppcheck version of Ubuntu 24.04
       run: echo "AMENT_CPPCHECK_ALLOW_SLOW_VERSIONS=1" >> $GITHUB_ENV
     - uses: ros-tooling/action-ros-lint@v0.1
       with:
-        distribution: rolling
+        distribution: jazzy
         linter: ${{ matrix.linter }}
         package-name:
           kortex_bringup
@@ -28,7 +28,7 @@ jobs:
   # the pre-commit hook also skips kortex_driver and kortex_api
   ament_lint_cmake:
     name: ament_lint_cmake
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -36,14 +36,14 @@ jobs:
     - uses: ros-tooling/setup-ros@v0.7
     - uses: ros-tooling/action-ros-lint@v0.1
       with:
-        distribution: rolling
+        distribution: jazzy
         linter: lint_cmake
         package-name:
           kortex_bringup
 
   ament_lint_100:
     name: ament_${{ matrix.linter }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +53,7 @@ jobs:
     - uses: ros-tooling/setup-ros@v0.7
     - uses: ros-tooling/action-ros-lint@v0.1
       with:
-        distribution: rolling
+        distribution: jazzy
         linter: cpplint
         arguments: "--linelength=100 --filter=-whitespace/newline --exclude=kortex_driver/src/kortex_math_util.cpp"
         package-name:

@@ -8,12 +8,13 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - frank
 
 jobs:
   pre-commit:
     name: Format
-    runs-on: ubuntu-latest
+    # clang-format-14 (the version .pre-commit-config.yaml calls) is not packaged on 24.04
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v6
     - uses: actions/setup-python@v6
