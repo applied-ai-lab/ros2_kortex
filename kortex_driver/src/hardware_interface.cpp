@@ -291,6 +291,7 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     use_internal_bus_gripper_comm_ = true;
     RCLCPP_INFO(LOGGER, "Using internal bus communication for gripper!");
   }
+  has_gripper_ = use_internal_bus_gripper_comm_ && !gripper_joint_name_.empty();
 
   // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false =
   // release it). The subscription lives on this component's node, spun by the controller manager's
@@ -773,21 +774,32 @@ CallbackReturn KortexMultiInterfaceHardware::on_activate(
     base_command_.add_actuators()->set_position(base_feedback.actuators(i).position());
   }
 
-  // Initialize gripper
-  float gripper_initial_position =
-    base_feedback.interconnect().gripper_feedback().motor()[0].position();
-  RCLCPP_INFO(LOGGER, "Gripper initial position is '%f'.", gripper_initial_position);
+  // Initialize gripper (Frank: only with a gripper configured, and it must be there: without one
+  // the arm's gripper feedback has no motor, and motor()[0] read out of bounds).
+  if (has_gripper_)
+  {
+    if (base_feedback.interconnect().gripper_feedback().motor_size() < 1)
+    {
+      RCLCPP_ERROR(
+        LOGGER, "Gripper '%s' is configured but the arm reports no gripper (does ee match?)",
+        gripper_joint_name_.c_str());
+      return CallbackReturn::ERROR;
+    }
+    float gripper_initial_position =
+      base_feedback.interconnect().gripper_feedback().motor()[0].position();
+    RCLCPP_INFO(LOGGER, "Gripper initial position is '%f'.", gripper_initial_position);
 
-  // to radians
-  gripper_command_position_ = gripper_initial_position / 100.0 * 0.81;
+    // to radians
+    gripper_command_position_ = gripper_initial_position / 100.0 * 0.81;
 
-  // Initialize interconnect command to current gripper position.
-  base_command_.mutable_interconnect()->mutable_command_id()->set_identifier(0);
-  gripper_motor_command_ =
-    base_command_.mutable_interconnect()->mutable_gripper_command()->add_motor_cmd();
-  gripper_motor_command_->set_position(gripper_initial_position);  // % position
-  gripper_motor_command_->set_velocity(gripper_speed_command_);    // % speed
-  gripper_motor_command_->set_force(gripper_force_command_);       // % force
+    // Initialize interconnect command to current gripper position.
+    base_command_.mutable_interconnect()->mutable_command_id()->set_identifier(0);
+    gripper_motor_command_ =
+      base_command_.mutable_interconnect()->mutable_gripper_command()->add_motor_cmd();
+    gripper_motor_command_->set_position(gripper_initial_position);  // % position
+    gripper_motor_command_->set_velocity(gripper_speed_command_);    // % speed
+    gripper_motor_command_->set_force(gripper_force_command_);       // % force
+  }
 
   // Send a first frame
   base_feedback = base_cyclic_.Refresh(base_command_);
@@ -912,7 +924,7 @@ void KortexMultiInterfaceHardware::readGripperPosition()
 {
   // max joint angle = 0.81 for robotiq_2f_85
   // TODO(anyone) read in as parameter from kortex_controllers.yaml
-  if (use_internal_bus_gripper_comm_)
+  if (has_gripper_)
   {
     gripper_position_ =
       feedback_.interconnect().gripper_feedback().motor()[0].position() / 100.0 * 0.81;  // rad
@@ -1244,7 +1256,7 @@ void KortexMultiInterfaceHardware::incrementId()
 void KortexMultiInterfaceHardware::sendGripperCommand(
   k_api::Base::ServoingMode arm_mode, double position, double velocity, double force)
 {
-  if (gripper_controller_running_ && !std::isnan(position) && use_internal_bus_gripper_comm_)
+  if (gripper_controller_running_ && !std::isnan(position) && has_gripper_)
   {
     try
     {

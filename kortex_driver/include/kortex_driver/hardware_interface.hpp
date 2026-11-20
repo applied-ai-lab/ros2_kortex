@@ -209,6 +209,8 @@ private:
   // gripper stuff
   std::string gripper_joint_name_;
   bool use_internal_bus_gripper_comm_;
+  // Frank: a gripper is configured (internal bus + gripper joint); false = none on this arm.
+  bool has_gripper_ = false;
 
   // temp variables to use in update loop
   float cmd_degrees_tmp_;
