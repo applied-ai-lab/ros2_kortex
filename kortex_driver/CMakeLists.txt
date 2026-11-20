@@ -27,6 +27,7 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(kortex_api REQUIRED)
+find_package(std_msgs REQUIRED)
 
 #Current: only support Linux x86_64
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
@@ -54,6 +55,7 @@ add_library(
   SHARED
   src/hardware_interface.cpp
   src/kortex_math_util.cpp
+  src/soft_stop.cpp
 )
 target_link_libraries(${PROJECT_NAME} KortexApiCpp)
 target_include_directories(
@@ -68,6 +70,7 @@ ament_target_dependencies(
   hardware_interface
   pluginlib
   rclcpp
+  std_msgs
 )
 
 pluginlib_export_plugin_description_file(hardware_interface hardware_interface_plugin.xml)
@@ -83,6 +86,11 @@ install(
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  # Soft stop: the latch logic and the topic subscription, without an arm.
+  ament_add_gtest(test_soft_stop test/test_soft_stop.cpp src/soft_stop.cpp)
+  target_include_directories(test_soft_stop PRIVATE include)
+  ament_target_dependencies(test_soft_stop rclcpp std_msgs)
 endif()
 
 ## EXPORTS
@@ -97,5 +105,6 @@ ament_export_dependencies(
   kortex_api
   pluginlib
   rclcpp
+  std_msgs
 )
 ament_package()
