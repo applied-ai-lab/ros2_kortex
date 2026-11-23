@@ -28,6 +28,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,14 @@
 namespace
 {
 const rclcpp::Logger LOGGER = rclcpp::get_logger("KortexMultiInterfaceHardware");
+
+std::int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
 }
+}  // namespace
 
 namespace kortex_driver
 {
@@ -75,7 +83,9 @@ KortexMultiInterfaceHardware::KortexMultiInterfaceHardware()
   start_fault_controller_(false),
   start_joint_velocity_control_(false),
   start_joint_position_control_(false),
+  start_joint_effort_control_(false),
   use_velocity_command_(false),
+  use_effort_command_(false),
   first_pass_(true),
   gripper_joint_name_(""),
   use_internal_bus_gripper_comm_(false)
@@ -203,6 +213,7 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
   RCLCPP_INFO(LOGGER, "Creating session for communication");
   session_manager_.CreateSession(create_session_info);
   session_manager_real_time_.CreateSession(create_session_info);
+  api_connected_ = true;
   RCLCPP_INFO(LOGGER, "Session created");
 
   // reset faults on activation, go back to low level servoing after
@@ -284,6 +295,165 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     }
   }
 
+  // Torque mode limits. Arm joints are info_.joints minus the gripper, in actuator order (the
+  // same pairing export_*_interfaces uses). A joint without a URDF effort limit cannot be put
+  // into torque mode: prepare_command_mode_switch refuses it.
+  effort_limits_.assign(actuator_count_, std::numeric_limits<double>::infinity());
+  last_effort_commands_.assign(actuator_count_, 0.0);
+  joint_calibration_.assign(actuator_count_, JointCalibration());
+  {
+    std::size_t arm_index = 0;
+    for (const auto & joint : info_.joints)
+    {
+      if (joint.name == gripper_joint_name_ || arm_index >= actuator_count_)
+      {
+        continue;
+      }
+      arm_joint_names_.push_back(joint.name);
+      const auto limits = info_.limits.find(joint.name);
+      if (
+        limits != info_.limits.end() && limits->second.has_effort_limits &&
+        std::isfinite(limits->second.max_effort) && limits->second.max_effort > 0.0)
+      {
+        effort_limits_[arm_index] = limits->second.max_effort;
+      }
+      RCLCPP_INFO(
+        LOGGER, "Torque mode limit for '%s': %.2f N*m", joint.name.c_str(),
+        effort_limits_[arm_index]);
+      // Kinematic calibration (joint_calibration.hpp): readings and position commands only,
+      // never the actuators' own zero. Inert unless the joint carries the params.
+      try
+      {
+        joint_calibration_[arm_index] = parseJointCalibration(joint.parameters);
+      }
+      catch (const std::exception & ex)
+      {
+        RCLCPP_ERROR(LOGGER, "Joint '%s': %s", joint.name.c_str(), ex.what());
+        return CallbackReturn::ERROR;
+      }
+      if (joint_calibration_[arm_index].active())
+      {
+        RCLCPP_INFO(
+          LOGGER,
+          "Joint calibration for '%s': offset %+.6f rad (%+.3f deg), compliance %.6g rad/(N*m)",
+          joint.name.c_str(), joint_calibration_[arm_index].offset,
+          KortexMathUtil::toDeg(joint_calibration_[arm_index].offset),
+          joint_calibration_[arm_index].compliance);
+      }
+      ++arm_index;
+    }
+  }
+  if (std::none_of(
+        joint_calibration_.begin(), joint_calibration_.end(),
+        [](const JointCalibration & c) { return c.active(); }))
+  {
+    RCLCPP_INFO(LOGGER, "Joint calibration: none (raw joint angles)");
+  }
+  else
+  {
+    RCLCPP_WARN(
+      LOGGER,
+      "Joint calibration applied to positions and position commands. Twist mode (the arm's own "
+      "Cartesian control) is NOT corrected; the arm's joint limits stay raw.");
+  }
+  // Optional torque mode parameters; the defaults are in the header.
+  const auto param = [this](const std::string & name) -> std::string
+  {
+    const auto it = info_.hardware_parameters.find(name);
+    return it == info_.hardware_parameters.end() ? std::string() : it->second;
+  };
+  try
+  {
+    if (!param("effort_command_max_step").empty())
+    {
+      effort_command_max_step_ = std::stod(param("effort_command_max_step"));
+    }
+    if (!param("effort_check_tolerance").empty())
+    {
+      effort_check_tolerance_ = std::stod(param("effort_check_tolerance"));
+    }
+    if (!param("effort_check_cycles").empty())
+    {
+      effort_check_cycles_ = std::stoi(param("effort_check_cycles"));
+    }
+    if (!param("effort_startup_check_ms").empty())
+    {
+      effort_startup_check_ms_ = std::stoi(param("effort_startup_check_ms"));
+    }
+    if (!param("cyclic_async").empty())
+    {
+      cyclic_async_ = param("cyclic_async") == "true" || param("cyclic_async") == "True";
+    }
+    if (!param("feedback_timeout_ms").empty())
+    {
+      feedback_timeout_ = std::chrono::milliseconds(std::stoi(param("feedback_timeout_ms")));
+    }
+  }
+  catch (const std::exception & ex)
+  {
+    RCLCPP_ERROR(LOGGER, "Bad torque mode parameter: %s", ex.what());
+    return CallbackReturn::ERROR;
+  }
+  if (
+    !std::isfinite(effort_command_max_step_) || !std::isfinite(effort_check_tolerance_) ||
+    !(effort_command_max_step_ > 0.0) || !(effort_check_tolerance_ > 0.0) ||
+    effort_check_cycles_ < 1 || effort_startup_check_ms_ < 0)
+  {
+    RCLCPP_ERROR(
+      LOGGER,
+      "Torque mode parameters out of range: effort_command_max_step and effort_check_tolerance "
+      "must be > 0, effort_check_cycles >= 1, effort_startup_check_ms >= 0!");
+    return CallbackReturn::ERROR;
+  }
+  RCLCPP_INFO(
+    LOGGER,
+    "Torque mode: commands change by at most %.3f N*m per cycle; sign check %.2f N*m over %d "
+    "cycles, %d ms while holding at the switch",
+    effort_command_max_step_, effort_check_tolerance_, effort_check_cycles_,
+    effort_startup_check_ms_);
+  if (feedback_timeout_.count() <= 0)
+  {
+    RCLCPP_ERROR(LOGGER, "feedback_timeout_ms must be > 0!");
+    return CallbackReturn::ERROR;
+  }
+  RCLCPP_INFO(
+    LOGGER, "Cyclic exchange: %s, feedback timeout %ld ms",
+    cyclic_async_ ? "non-blocking (Refresh_callback)" : "blocking (Refresh)",
+    static_cast<long>(feedback_timeout_.count()));
+
+  // "1 1 1 1 1 1" (or comma separated): +1 where kortex's torque_joint command already is in
+  // the ROS convention, -1 where it is reversed. Kinova's example 108 commands the negated
+  // reported torque to hold, which makes it +1 on every joint; that is the default, but it is
+  // unmeasured until the per-joint sign test has been run on this arm.
+  effort_command_signs_.assign(actuator_count_, 1.0);
+  {
+    std::string signs = param("effort_command_signs");
+    std::replace(signs.begin(), signs.end(), ',', ' ');
+    std::istringstream stream(signs);
+    std::vector<double> parsed;
+    for (double sign; stream >> sign;)
+    {
+      parsed.push_back(sign);
+    }
+    if (!signs.empty() && signs.find_first_not_of(' ') != std::string::npos)
+    {
+      if (
+        !stream.eof() || parsed.size() != actuator_count_ ||
+        std::any_of(parsed.begin(), parsed.end(), [](double v) { return v != 1.0 && v != -1.0; }))
+      {
+        RCLCPP_ERROR(
+          LOGGER, "effort_command_signs must be %zu values, each 1 or -1; got '%s'",
+          actuator_count_, param("effort_command_signs").c_str());
+        return CallbackReturn::ERROR;
+      }
+      effort_command_signs_ = parsed;
+      effort_command_signs_set_ = true;
+    }
+  }
+  effort_disagreement_cycles_.assign(actuator_count_, 0);
+  torque_joints_.assign(actuator_count_, false);
+  start_torque_joints_.assign(actuator_count_, false);
+
   if (
     (info_.hardware_parameters["use_internal_bus_gripper_comm"] == "true") ||
     (info_.hardware_parameters["use_internal_bus_gripper_comm"] == "True"))
@@ -291,7 +461,13 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     use_internal_bus_gripper_comm_ = true;
     RCLCPP_INFO(LOGGER, "Using internal bus communication for gripper!");
   }
+
   has_gripper_ = use_internal_bus_gripper_comm_ && !gripper_joint_name_.empty();
+  if (arm_joint_names_.size() != actuator_count_ ||
+      info_.joints.size() != actuator_count_ + (has_gripper_ ? 1u : 0u)) {
+    RCLCPP_ERROR(LOGGER, "Hardware joint list does not match arm/gripper feedback");
+    return CallbackReturn::ERROR;
+  }
 
   // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false =
   // release it). The subscription lives on this component's node, spun by the controller manager's
@@ -460,11 +636,10 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
     stop_gripper_controller_ = false;
   start_joint_based_controller_ = start_twist_controller_ = start_fault_controller_ =
     start_gripper_controller_ = false;
-  start_joint_velocity_control_ = start_joint_position_control_ = false;
+  start_joint_velocity_control_ = start_joint_position_control_ = start_joint_effort_control_ =
+    false;
+  std::fill(start_torque_joints_.begin(), start_torque_joints_.end(), false);
 
-  // sleep to ensure all outgoing write commands have finished
-  block_write = true;
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   start_modes_.clear();
   stop_modes_.clear();
@@ -496,15 +671,10 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
       {
         stop_modes_.emplace_back(StopStartInterface::STOP_POS_VEL);
       }
+      // effort is a joint based controller too: the actuators go to TORQUE mode
       if (key == joint.name + "/" + hardware_interface::HW_IF_EFFORT)
       {
-        continue;
-        // not supporting effort command interface
-        //              start_modes_.emplace_back(hardware_interface::HW_IF_EFFORT);
-        RCLCPP_ERROR(
-          LOGGER,
-          "KortexMultiInterfaceHardware does not support effort command "
-          "interface!");
+        stop_modes_.emplace_back(StopStartInterface::STOP_POS_VEL);
       }
     }
     if (
@@ -551,11 +721,16 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
       }
       if (key == joint.name + "/" + hardware_interface::HW_IF_EFFORT)
       {
-        continue;
-        RCLCPP_ERROR(
-          LOGGER,
-          "KortexMultiInterfaceHardware does not support effort command "
-          "interface!");
+        start_modes_.emplace_back(StopStartInterface::START_POS_VEL);
+        start_joint_effort_control_ = true;
+        // only the claimed joints go to TORQUE mode, the others hold their position
+        const auto arm_joint =
+          std::find(arm_joint_names_.begin(), arm_joint_names_.end(), joint.name);
+        if (arm_joint != arm_joint_names_.end())
+        {
+          start_torque_joints_[static_cast<std::size_t>(arm_joint - arm_joint_names_.begin())] =
+            true;
+        }
       }
     }
     if (
@@ -630,6 +805,14 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
     start_fault_controller_ = true;
   }
 
+  if (start_joint_based_controller_ && start_twist_controller_) {
+    RCLCPP_ERROR(LOGGER, "Cannot start joint and twist controllers together");
+    return return_type::ERROR;
+  }
+  if (joint_based_controller_running_ && start_joint_based_controller_ && !stop_joint_based_controller_) {
+    RCLCPP_ERROR(LOGGER, "Deactivate the current arm controller before starting another");
+    return return_type::ERROR;
+  }
   // handle exclusiveness between twist and joint based controller
   if (twist_controller_running_ && start_joint_based_controller_ && !stop_twist_controller_)
   {
@@ -642,25 +825,60 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
     return hardware_interface::return_type::ERROR;
   }
 
-  // position and velocity joint command interfaces drive the same actuators with conflicting
-  // control modes, so only one joint based controller (position OR velocity) may run at a time
-  if (start_joint_position_control_ && start_joint_velocity_control_)
+  // position, velocity and effort joint command interfaces drive the same actuators with
+  // conflicting control modes, so only one joint based controller (position OR velocity OR
+  // effort) may run at a time
+  if (
+    static_cast<int>(start_joint_position_control_) +
+      static_cast<int>(start_joint_velocity_control_) +
+      static_cast<int>(start_joint_effort_control_) >
+    1)
   {
     RCLCPP_ERROR(
       LOGGER,
-      "Can't start a joint based controller claiming both position and velocity interfaces!");
+      "Can't start a joint based controller claiming more than one of the position, velocity "
+      "and effort interfaces!");
     return hardware_interface::return_type::ERROR;
   }
   if (
     joint_based_controller_running_ && !stop_joint_based_controller_ &&
     ((start_joint_velocity_control_ && !use_velocity_command_) ||
-     (start_joint_position_control_ && use_velocity_command_)))
+     (start_joint_effort_control_ && !use_effort_command_) ||
+     (start_joint_position_control_ && (use_velocity_command_ || use_effort_command_))))
   {
     RCLCPP_ERROR(
       LOGGER,
-      "Can't start a velocity (position) joint controller while a position (velocity) joint "
-      "controller is running! Deactivate the running controller first.");
+      "Can't start a joint controller of a different kind (position, velocity, effort) while "
+      "another joint controller is running! Deactivate the running controller first.");
     return hardware_interface::return_type::ERROR;
+  }
+  if (start_joint_effort_control_)
+  {
+    if (!std::all_of(start_torque_joints_.begin(), start_torque_joints_.end(), [](bool x){return x;})) {
+      RCLCPP_ERROR(LOGGER, "FRANK effort control must claim all arm joints together");
+      return return_type::ERROR;
+    }
+    if (soft_stop_.engaged() || soft_stop_.stop_wanted()) {
+      RCLCPP_ERROR(LOGGER, "Cannot enter TORQUE mode while soft-stopped");
+      return return_type::ERROR;
+    }
+    // Unclamped torque on a real arm is not an option, and neither is switching a faulted one.
+    bool unlimited = false;
+    for (std::size_t i = 0; i < actuator_count_; i++)
+    {
+      unlimited |= start_torque_joints_[i] && std::isinf(effort_limits_[i]);
+    }
+    if (unlimited)
+    {
+      RCLCPP_ERROR(
+        LOGGER, "Can't start an effort controller: a joint has no URDF effort limit to clamp to!");
+      return hardware_interface::return_type::ERROR;
+    }
+    if (in_fault_ != 0.0)
+    {
+      RCLCPP_ERROR(LOGGER, "Can't start an effort controller while the robot is faulted!");
+      return hardware_interface::return_type::ERROR;
+    }
   }
 
   return ret_val;
@@ -670,6 +888,13 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
   const vector<std::string> & /*start_interfaces*/, const vector<std::string> & /*stop_interfaces*/)
 {
   hardware_interface::return_type ret_val = hardware_interface::return_type::OK;
+  struct WriteGuard {
+    std::atomic<bool>& blocked;
+    explicit WriteGuard(std::atomic<bool>& b) : blocked(b) { blocked = true; }
+    ~WriteGuard() { blocked = false; }
+  } write_guard(block_write);
+  try {
+
 
   if (stop_joint_based_controller_)
   {
@@ -678,10 +903,16 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     // default position control mode so a following position command does not surprise the user
     if (use_velocity_command_)
     {
-      setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION);
+      if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION))
+        throw std::runtime_error("failed to restore POSITION mode");
       use_velocity_command_ = false;
     }
-    arm_commands_positions_ = arm_positions_;
+    if (use_effort_command_)
+    {
+      if (!leaveTorqueMode()) throw std::runtime_error("failed to restore POSITION mode");
+    }
+    holdMeasuredPosition();
+    if (!sendHoldFrame()) throw std::runtime_error("failed to send measured-position hold");
     std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
   }
   if (stop_twist_controller_)
@@ -705,22 +936,36 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     base_.SetServoingMode(servoing_mode_hw_);
     arm_mode_ = k_api::Base::ServoingMode::LOW_LEVEL_SERVOING;
     twist_controller_running_ = false;
-    arm_commands_positions_ = arm_positions_;
+    holdMeasuredPosition();
     std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+    joint_based_controller_running_ = true;
     // select the actuator control mode matching the claimed command interface
     if (start_joint_velocity_control_)
     {
-      setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::VELOCITY);
+      if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::VELOCITY))
+        throw std::runtime_error("failed to enter VELOCITY mode");
       use_velocity_command_ = true;
+    }
+    else if (start_joint_effort_control_)
+    {
+      use_velocity_command_ = false;
+      torque_joints_ = start_torque_joints_;
+      if (!enterTorqueMode())
+      {
+        // enterTorqueMode has put the arm back into POSITION mode, holding
+        joint_based_controller_running_ = false;
+        ret_val = hardware_interface::return_type::ERROR;
+      }
     }
     else
     {
-      setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION);
+      if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION))
+        throw std::runtime_error("failed to enter POSITION mode");
       use_velocity_command_ = false;
     }
-    joint_based_controller_running_ = true;
     // refresh feedback
     feedback_ = base_cyclic_.RefreshFeedback();
+    acceptBlockingFeedback();
   }
   if (start_twist_controller_)
   {
@@ -741,31 +986,86 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     fault_controller_running_ = true;
   }
 
+  if (ret_val == return_type::OK && (start_joint_based_controller_ || start_twist_controller_))
+    soft_stop_.on_controller_switch();
   // reset auxiliary switching booleans
   stop_joint_based_controller_ = stop_twist_controller_ = stop_fault_controller_ =
     stop_gripper_controller_ = false;
   start_joint_based_controller_ = start_twist_controller_ = start_fault_controller_ =
     start_gripper_controller_ = false;
-  start_joint_velocity_control_ = start_joint_position_control_ = false;
+  start_joint_velocity_control_ = start_joint_position_control_ = start_joint_effort_control_ =
+    false;
 
   start_modes_.clear();
   stop_modes_.clear();
 
-  // after a soft stop is released the arm holds until the operator switches controllers
-  soft_stop_.on_controller_switch();
-
   block_write = false;
 
   return ret_val;
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(LOGGER, "Mode switch failed: %s", e.what());
+    joint_based_controller_running_ = false;
+    if (applyEmergencyStop()) soft_stop_.mark_engaged();
+    return return_type::ERROR;
+  } catch (...) {
+    joint_based_controller_running_ = false;
+    if (applyEmergencyStop()) soft_stop_.mark_engaged();
+    return return_type::ERROR;
+  }
 }
 
 CallbackReturn KortexMultiInterfaceHardware::on_activate(
   const rclcpp_lifecycle::State & /* previous_state */)
 {
   RCLCPP_INFO(LOGGER, "Activating KortexMultiInterfaceHardware...");
-  // the soft stop watchdog's first deadline counts from activation
+
   soft_stop_.start();
-  // first read
+  if (soft_stop_.stop_wanted()) {
+    RCLCPP_ERROR(LOGGER, "Hardware activation refused while soft stop is requested");
+    return CallbackReturn::ERROR;
+  }
+
+  // Coming back from a deactivation needs no reconnect: on_deactivate leaves
+  // the API connection up and only drops the arm to SINGLE_LEVEL_SERVOING, so
+  // activation is simply the reverse of that.
+  //
+  // Reconnecting instead was tried and does not work. The transports can be
+  // reconnected and the routers reactivated, but nothing re-registers the
+  // router's onMessage() callback on the transport, so the receive thread
+  // invokes an empty std::function and throws std::bad_function_call from
+  // TransportClientTcp::receiveThread -- on a detached thread, which aborts
+  // ros2_control_node rather than failing the transition. The callback is
+  // registered in RouterClient's constructor and there is no public way to
+  // re-register it, so the connection must simply not be torn down.
+  //
+  // Clear faults first, as on_init does: re-acquiring the arm is how an operator
+  // recovers it, so it should recover it.
+  try
+  {
+    base_.ClearFaults();
+  }
+  catch (k_api::KDetailedException & ex)
+  {
+    RCLCPP_ERROR_STREAM(LOGGER, "ClearFaults on activation: " << ex.what());
+  }
+
+  if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION))
+    return CallbackReturn::ERROR;
+  use_effort_command_ = use_velocity_command_ = false;
+  torque_joints_.assign(actuator_count_, false);
+  joint_based_controller_running_ = twist_controller_running_ = false;
+  if (soft_stop_.engaged()) soft_stop_.mark_released();
+
+  // Setting the mode unconditionally matches on_init, which also ends in
+  // LOW_LEVEL_SERVOING every time.
+  servoing_mode_hw_.set_servoing_mode(Kinova::Api::Base::LOW_LEVEL_SERVOING);
+  base_.SetServoingMode(servoing_mode_hw_);
+  arm_mode_ = Kinova::Api::Base::LOW_LEVEL_SERVOING;
+
+  // add_actuators() appends, and on_activate can now run more than once, so
+  // without this the repeated field grows by actuator_count_ per activation.
+  base_command_.clear_actuators();
+
   auto base_feedback = base_cyclic_.RefreshFeedback();
 
   // Add each actuator to the base_command_ and set the command to its current position
@@ -774,69 +1074,61 @@ CallbackReturn KortexMultiInterfaceHardware::on_activate(
     base_command_.add_actuators()->set_position(base_feedback.actuators(i).position());
   }
 
-  // Initialize gripper (Frank: only with a gripper configured, and it must be there: without one
-  // the arm's gripper feedback has no motor, and motor()[0] read out of bounds).
-  if (has_gripper_)
-  {
-    if (base_feedback.interconnect().gripper_feedback().motor_size() < 1)
-    {
-      RCLCPP_ERROR(
-        LOGGER, "Gripper '%s' is configured but the arm reports no gripper (does ee match?)",
-        gripper_joint_name_.c_str());
+  base_command_.clear_interconnect();
+  gripper_motor_command_ = nullptr;
+  if (has_gripper_) {
+    if (base_feedback.interconnect().gripper_feedback().motor_size() < 1) {
+      RCLCPP_ERROR(LOGGER, "Configured gripper has no feedback motor");
       return CallbackReturn::ERROR;
     }
-    float gripper_initial_position =
-      base_feedback.interconnect().gripper_feedback().motor()[0].position();
-    RCLCPP_INFO(LOGGER, "Gripper initial position is '%f'.", gripper_initial_position);
+  // Initialize gripper
+  float gripper_initial_position =
+    base_feedback.interconnect().gripper_feedback().motor()[0].position();
+  RCLCPP_INFO(LOGGER, "Gripper initial position is '%f'.", gripper_initial_position);
 
-    // to radians
-    gripper_command_position_ = gripper_initial_position / 100.0 * 0.81;
+  // to radians
+  gripper_command_position_ = gripper_initial_position / 100.0 * 0.81;
 
-    // Initialize interconnect command to current gripper position.
-    base_command_.mutable_interconnect()->mutable_command_id()->set_identifier(0);
-    gripper_motor_command_ =
-      base_command_.mutable_interconnect()->mutable_gripper_command()->add_motor_cmd();
-    gripper_motor_command_->set_position(gripper_initial_position);  // % position
-    gripper_motor_command_->set_velocity(gripper_speed_command_);    // % speed
-    gripper_motor_command_->set_force(gripper_force_command_);       // % force
+  // Initialize interconnect command to current gripper position.
+  base_command_.mutable_interconnect()->mutable_command_id()->set_identifier(0);
+  // Clear before adding: add_motor_cmd() appends, and on_activate can now run
+  // more than once, so without this the repeated field grows by one entry per
+  // activation and the gripper command we hold is not the only one sent.
+  base_command_.mutable_interconnect()->mutable_gripper_command()->clear_motor_cmd();
+  gripper_motor_command_ =
+    base_command_.mutable_interconnect()->mutable_gripper_command()->add_motor_cmd();
+  gripper_motor_command_->set_position(gripper_initial_position);  // % position
+  gripper_motor_command_->set_velocity(gripper_speed_command_);    // % speed
+  gripper_motor_command_->set_force(gripper_force_command_);       // % force
+
   }
 
   // Send a first frame
   base_feedback = base_cyclic_.Refresh(base_command_);
-  // Set some default values
-  for (std::size_t i = 0; i < actuator_count_; i++)
-  {
-    if (std::isnan(arm_positions_[i]))
-    {
-      arm_positions_[i] = KortexMathUtil::wrapRadiansFromMinusPiToPi(
-        KortexMathUtil::toRad(base_feedback.actuators(i).position()));  // rad
-    }
-    if (std::isnan(arm_velocities_[i]))
-    {
-      arm_velocities_[i] = 0;
-    }
-    if (std::isnan(arm_efforts_[i]))
-    {
-      arm_efforts_[i] = 0;
-    }
-    if (std::isnan(arm_commands_positions_[i]))
-    {
-      arm_commands_positions_[i] = KortexMathUtil::wrapRadiansFromMinusPiToPi(
-        KortexMathUtil::toRad(base_feedback.actuators(i).position()));  // rad
-    }
-    if (std::isnan(arm_commands_velocities_[i]))
-    {
-      arm_commands_velocities_[i] = 0;
-    }
-    if (std::isnan(arm_commands_efforts_[i]))
-    {
-      arm_commands_efforts_[i] = 0;
-    }
-    arm_joints_control_level_[i] = integration_lvl_t::UNDEFINED;
-  }
+  acceptBlockingFeedback();
+  // Re-seed on every activation, including after manual repositioning in SINGLE_LEVEL_SERVOING.
+  if (!seedArmState(base_feedback)) return CallbackReturn::ERROR;
 
   RCLCPP_INFO(LOGGER, "KortexMultiInterfaceHardware successfully activated!");
   return CallbackReturn::SUCCESS;
+}
+
+bool KortexMultiInterfaceHardware::seedArmState(const k_api::BaseCyclic::Feedback& feedback)
+{
+  if (feedback.actuators_size() != static_cast<int>(actuator_count_)) return false;
+  for (std::size_t i = 0; i < actuator_count_; ++i)
+    if (!std::isfinite(feedback.actuators(i).position()) ||
+        !std::isfinite(feedback.actuators(i).velocity()) || !std::isfinite(feedback.actuators(i).torque())) return false;
+  for (std::size_t i = 0; i < actuator_count_; ++i) {
+    arm_positions_[i] = calibratedPosition(feedback, i);
+    arm_velocities_[i] = KortexMathUtil::toRad(feedback.actuators(i).velocity());
+    arm_efforts_[i] = REPORTED_TORQUE_SIGN * feedback.actuators(i).torque();
+    arm_commands_positions_[i] = arm_positions_[i];
+    arm_commands_velocities_[i] = 0;
+    arm_commands_efforts_[i] = last_effort_commands_[i] = arm_efforts_[i];
+    arm_joints_control_level_[i] = integration_lvl_t::UNDEFINED;
+  }
+  return true;
 }
 
 CallbackReturn KortexMultiInterfaceHardware::on_deactivate(
@@ -850,28 +1142,79 @@ CallbackReturn KortexMultiInterfaceHardware::on_deactivate(
     setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION);
     use_velocity_command_ = false;
   }
+  if (use_effort_command_)
+  {
+    if (!leaveTorqueMode()) return CallbackReturn::ERROR;
+  }
 
   auto servoing_mode = k_api::Base::ServoingModeInformation();
   // Set back the servoing mode to Single Level Servoing
   servoing_mode.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
   base_.SetServoingMode(servoing_mode);
 
-  // Close API session
-  session_manager_.CloseSession();
-  session_manager_real_time_.CloseSession();
+  // The API connection is deliberately left UP, and the sessions open.
+  //
+  // Deactivating is a handover, not a shutdown: SINGLE_LEVEL_SERVOING above is
+  // what frees the arm for the teach pendant and admittance mode, and that is
+  // all the caller wants. Closing the sessions and dropping the transports as
+  // well made deactivation a one-way door, because the connection cannot be
+  // rebuilt from on_activate (see the note there).
+  //
+  // The teardown now lives in on_cleanup/on_shutdown, so a real shutdown still
+  // closes its sessions politely instead of leaving the arm holding them until
+  // they time out.
 
-  // Deactivate the router and cleanly disconnect from the transport object
+  // k_api_twist_ and gripper_motor_command_ used to be deleted here. Both
+  // point INTO protobuf messages that own them -- mutable_twist() and
+  // add_motor_cmd() respectively -- so deleting them was undefined behaviour,
+  // and it orphaned k_api_twist_, which is assigned only in on_init, leaving
+  // sendTwistCommand() writing through a dangling pointer after any
+  // deactivate/activate cycle. The owning messages are members and free their
+  // own storage.
+
+  RCLCPP_INFO(LOGGER, "KortexMultiInterfaceHardware successfully deactivated!");
+
+  return CallbackReturn::SUCCESS;
+}
+
+void KortexMultiInterfaceHardware::disconnectApi()
+{
+  if (!api_connected_)
+  {
+    return;
+  }
+  api_connected_ = false;
+
+  RCLCPP_INFO(LOGGER, "Closing Kortex sessions and disconnecting.");
+  try
+  {
+    session_manager_.CloseSession();
+    session_manager_real_time_.CloseSession();
+  }
+  catch (const std::exception & ex)
+  {
+    // Worth logging but not worth failing the transition: we are on the way
+    // out either way, and an unreachable arm cannot be told politely.
+    RCLCPP_WARN_STREAM(LOGGER, "While closing the Kortex sessions: " << ex.what());
+  }
+
   router_tcp_.SetActivationStatus(false);
   transport_tcp_.disconnect();
   router_udp_realtime_.SetActivationStatus(false);
   transport_udp_realtime_.disconnect();
+}
 
-  // memory handling
-  delete k_api_twist_;
-  delete gripper_motor_command_;
+CallbackReturn KortexMultiInterfaceHardware::on_cleanup(
+  const rclcpp_lifecycle::State & /* previous_state */)
+{
+  disconnectApi();
+  return CallbackReturn::SUCCESS;
+}
 
-  RCLCPP_INFO(LOGGER, "KortexMultiInterfaceHardware successfully deactivated!");
-
+CallbackReturn KortexMultiInterfaceHardware::on_shutdown(
+  const rclcpp_lifecycle::State & /* previous_state */)
+{
+  disconnectApi();
   return CallbackReturn::SUCCESS;
 }
 
@@ -882,10 +1225,41 @@ return_type KortexMultiInterfaceHardware::read(
   {
     first_pass_ = false;
     feedback_ = base_cyclic_.RefreshFeedback();
+    acceptBlockingFeedback();
   }
 
-  // read if robot is faulted
+  if (cyclic_async_)
+  {
+    // Take the newest reply if there is one. try_to_lock: the receive thread holds the lock only
+    // to copy a reply in, and waiting for it is exactly what this replaces -- on a miss, the
+    // reply is taken next cycle.
+    std::unique_lock<std::mutex> lock(replies_->mutex, std::try_to_lock);
+    if (lock.owns_lock() && replies_->fresh)
+    {
+      feedback_.Swap(&replies_->feedback);
+      replies_->fresh = false;
+    }
+  }
+  // A silent arm must not leave the controllers running on frozen feedback -- in_fault_ below
+  // is read from it too. (In blocking mode Refresh itself waits, and throws after 3 s.)
+  const std::int64_t unanswered_since = replies_->unanswered_since_ns.load();
+  const auto silent = std::chrono::nanoseconds(steadyNowNs() - unanswered_since);
+  if (unanswered_since != 0 && silent > feedback_timeout_)
+  {
+    RCLCPP_ERROR(
+      LOGGER, "No feedback from the arm for %ld ms (feedback_timeout_ms %ld)",
+      static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(silent).count()),
+      static_cast<long>(feedback_timeout_.count()));
+    return return_type::ERROR;
+  }
+
+  // Whether the arm is faulted is the arm's own call (ARMSTATE_IN_FAULT), plus any live
+  // actuator fault. The base's fault banks are not part of it: they keep a fault latched after
+  // the arm has recovered and ClearFaults does not reset it (a JOINT_FAULT bit, 2026-10-14:
+  // arm state normal, every actuator clean, the Kinova's own admittance working), and counting
+  // it held every command back until a reconnect, with nothing in the log. They are logged.
   in_fault_ = (feedback_.base().active_state() == Kinova::Api::Common::ArmState::ARMSTATE_IN_FAULT);
+  logBankChanges();
 
   // read gripper state
   readGripperPosition();
@@ -893,14 +1267,11 @@ return_type KortexMultiInterfaceHardware::read(
   for (std::size_t i = 0; i < actuator_count_; i++)
   {
     // read torque
-    arm_efforts_[i] = feedback_.actuators(i).torque();  // N*m
+    arm_efforts_[i] = REPORTED_TORQUE_SIGN * feedback_.actuators(i).torque();  // N*m, ROS sign
     // read velocity
     arm_velocities_[i] = KortexMathUtil::toRad(feedback_.actuators(i).velocity());  // rad/sec
-    // read position
-    num_turns_tmp_ = 0;
-    arm_positions_[i] = KortexMathUtil::wrapRadiansFromMinusPiToPi(
-      KortexMathUtil::toRad(feedback_.actuators(i).position()),
-      num_turns_tmp_);  // rad
+    // read position, calibrated (joint_calibration_; the raw angle when there is none)
+    arm_positions_[i] = calibratedPosition(feedback_, i);  // rad
 
     in_fault_ += (feedback_.actuators(i).fault_bank_a() + feedback_.actuators(i).fault_bank_b());
 
@@ -908,11 +1279,6 @@ return_type KortexMultiInterfaceHardware::read(
     //       feedback_.actuators(i).warning_bank_a() + feedback_.actuators(i).warning_bank_b());
   }
 
-  // add all base's faults and warnings into series
-  in_fault_ += (feedback_.base().fault_bank_a() + feedback_.base().fault_bank_b());
-
-  // TODO(livanov93): separate warnings into another variable to expose it via fault controller
-  //     + feedback_.base().warning_bank_a() + feedback_.base().warning_bank_b());
 
   // add mode that can't be easily reached
   in_fault_ += (feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY);
@@ -920,11 +1286,90 @@ return_type KortexMultiInterfaceHardware::read(
   return return_type::OK;
 }
 
+namespace
+{
+template <typename NameFn>
+std::string bitNames(uint32_t bits, NameFn name)
+{
+  std::string out;
+  for (uint32_t b = 1; b != 0; b <<= 1)
+  {
+    if (bits & b)
+    {
+      std::string n = name(static_cast<int>(b));
+      out += (out.empty() ? "" : " ") + (n.empty() ? std::to_string(b) : n);
+    }
+  }
+  return out.empty() ? "none" : out;
+}
+}  // namespace
+
+void KortexMultiInterfaceHardware::logBankChanges()
+{
+  // Rare (a fault or warning appearing or clearing), so logging here does not load the loop.
+  std::vector<uint32_t> banks{feedback_.base().fault_bank_a(), feedback_.base().fault_bank_b(),
+                              feedback_.base().warning_bank_a(), feedback_.base().warning_bank_b()};
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    banks.push_back(feedback_.actuators(i).fault_bank_a());
+    banks.push_back(feedback_.actuators(i).warning_bank_a());
+  }
+  if (banks == logged_banks_)
+  {
+    return;
+  }
+  if (logged_banks_.size() != banks.size())
+  {
+    logged_banks_.assign(banks.size(), 0);
+  }
+  auto base_name = [](int v)
+  { return k_api::Base::SafetyIdentifier_Name(static_cast<k_api::Base::SafetyIdentifier>(v)); };
+  auto act_name = [](int v)
+  {
+    return k_api::ActuatorConfig::SafetyIdentifierBankA_Name(
+      static_cast<k_api::ActuatorConfig::SafetyIdentifierBankA>(v));
+  };
+  const auto state = k_api::Common::ArmState_Name(feedback_.base().active_state());
+  const char * kind[] = {"faults A", "faults B", "warnings A", "warnings B"};
+  for (std::size_t k = 0; k < 4; k++)
+  {
+    if (banks[k] != logged_banks_[k])
+    {
+      RCLCPP_WARN(
+        LOGGER, "Kinova base %s: %s (arm state %s)", kind[k], bitNames(banks[k], base_name).c_str(),
+        state.c_str());
+    }
+  }
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    for (std::size_t k = 0; k < 2; k++)
+    {
+      const std::size_t j = 4 + 2 * i + k;
+      if (banks[j] != logged_banks_[j])
+      {
+        RCLCPP_WARN(
+          LOGGER, "Kinova joint_%zu %s: %s (arm state %s)", i + 1, k ? "warnings" : "faults",
+          bitNames(banks[j], act_name).c_str(), state.c_str());
+      }
+    }
+  }
+  logged_banks_ = banks;
+}
+
+double KortexMultiInterfaceHardware::calibratedPosition(
+  const k_api::BaseCyclic::Feedback & feedback, std::size_t i) const
+{
+  const auto & actuator = feedback.actuators(static_cast<int>(i));
+  const double raw = KortexMathUtil::toRad(actuator.position());  // rad
+  const double effort = REPORTED_TORQUE_SIGN * actuator.torque();  // N*m, ROS sign
+  return KortexMathUtil::wrapRadiansFromMinusPiToPi(joint_calibration_[i].calibrated(raw, effort));
+}
+
 void KortexMultiInterfaceHardware::readGripperPosition()
 {
   // max joint angle = 0.81 for robotiq_2f_85
   // TODO(anyone) read in as parameter from kortex_controllers.yaml
-  if (has_gripper_)
+  if (has_gripper_ && feedback_.interconnect().gripper_feedback().motor_size() > 0)
   {
     gripper_position_ =
       feedback_.interconnect().gripper_feedback().motor()[0].position() / 100.0 * 0.81;  // rad
@@ -934,21 +1379,19 @@ void KortexMultiInterfaceHardware::readGripperPosition()
 return_type KortexMultiInterfaceHardware::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  if (block_write)
-  {
-    feedback_ = base_cyclic_.RefreshFeedback();
-    return return_type::OK;
-  }
-
   handleSoftStop();
-
-  if (!std::isnan(reset_fault_cmd_) && fault_controller_running_ && soft_stop_.engaged())
-  {
-    // the fault reset would also clear the soft stop's emergency stop: only releasing the soft
-    // stop may do that
-    RCLCPP_ERROR(LOGGER, "Fault reset refused: the soft stop is engaged (release it first)");
+  // Complete a refused reset request while stopped; do not let it execute on a later release.
+  if (!std::isnan(reset_fault_cmd_) && fault_controller_running_ &&
+      (soft_stop_.engaged() || soft_stop_.stop_wanted())) {
     reset_fault_async_success_ = 0.0;
     reset_fault_cmd_ = NO_CMD;
+  }
+  if (soft_stop_.engaged() || soft_stop_.stop_wanted()) { cyclicRefresh(false); return return_type::OK; }
+
+  if (block_write)
+  {
+    cyclicRefresh(false);
+    return return_type::OK;
   }
 
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_)
@@ -972,6 +1415,16 @@ return_type KortexMultiInterfaceHardware::write(
         servoing_mode_hw_.set_servoing_mode(arm_mode_);
         base_.SetServoingMode(servoing_mode_hw_);
       }
+      // A fault clears in POSITION mode, holding. The effort controller stays active but its
+      // commands are ignored until it is re-activated: torque mode is never resumed silently.
+      if (use_effort_command_)
+      {
+        if (!leaveTorqueMode()) throw std::runtime_error("failed to restore POSITION mode");
+        RCLCPP_WARN(
+          LOGGER,
+          "Fault reset left torque mode: the arm holds position. Re-activate the effort "
+          "controller to resume.");
+      }
       reset_fault_async_success_ = 1.0;
     }
     catch (k_api::KDetailedException & ex)
@@ -994,7 +1447,7 @@ return_type KortexMultiInterfaceHardware::write(
   {
     if (arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING)
     {
-      // Twist controller active (not while holding after a soft stop: no twist command = no motion)
+      // Twist controller active
       if (twist_controller_running_ && !soft_stop_.holding())
       {
         // twist control
@@ -1007,13 +1460,10 @@ return_type KortexMultiInterfaceHardware::write(
       }
 
       // gripper control
-      if (!soft_stop_.holding())
-      {
-        sendGripperCommand(
-          arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
-      }
+      sendGripperCommand(
+        arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
       // read after write in twist mode
-      feedback_ = base_cyclic_.RefreshFeedback();
+      cyclicRefresh(false);
     }
     else if (
       (arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING) &&
@@ -1022,18 +1472,14 @@ return_type KortexMultiInterfaceHardware::write(
       // Per joint controller active
 
       // gripper control
-      if (!soft_stop_.holding())
-      {
-        sendGripperCommand(
-          arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
-      }
+      sendGripperCommand(
+        arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
 
       if (joint_based_controller_running_)
       {
-        if (soft_stop_.holding())
-        {
-          // hold the measured position instead of the controller's command (see SoftStopLatch)
-          arm_commands_positions_ = arm_positions_;
+        if (soft_stop_.holding()) {
+          if (use_effort_command_ && !leaveTorqueMode()) return return_type::ERROR;
+          holdMeasuredPosition();
           std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
         }
         // send commands to the joints
@@ -1042,14 +1488,14 @@ return_type KortexMultiInterfaceHardware::write(
       else
       {
         // Keep alive mode - no controller active
-        feedback_ = base_cyclic_.RefreshFeedback();
+        cyclicRefresh(false);
         // RCLCPP_DEBUG(LOGGER, "No controller active in LOW_LEVEL_SERVOING mode !");
       }
     }
     else
     {
       // Keep alive mode - no controller active
-      feedback_ = base_cyclic_.RefreshFeedback();
+      cyclicRefresh(false);
       RCLCPP_DEBUG(
         LOGGER,
         "Fault was not recognized on the robot but combination of Control Mode and Active State "
@@ -1060,7 +1506,7 @@ return_type KortexMultiInterfaceHardware::write(
   {
     // this is needed when the robot was faulted
     // so we can internally conclude it is not faulted anymore
-    feedback_ = base_cyclic_.RefreshFeedback();
+    cyclicRefresh(false);
   }
 
   return return_type::OK;
@@ -1133,6 +1579,12 @@ bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
     servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
     base_.SetServoingMode(servoing_mode_hw_);
     base_.ClearFaults();
+    if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION)) return false;
+    use_effort_command_ = false;
+    use_velocity_command_ = false;
+    torque_joints_.assign(actuator_count_, false);
+    holdMeasuredPosition();
+    std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
     if (
       arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING ||
       arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING)
@@ -1158,11 +1610,37 @@ void KortexMultiInterfaceHardware::prepareCommands()
   for (size_t i = 0; i < actuator_count_; i++)
   {
     // set command per joint
+    // The command is in calibrated angles; the arm takes raw ones. The compliance term uses the
+    // torque the joint carries now (the last read), so a joint holding a load is commanded where
+    // its encoder will read once deflected.
     cmd_degrees_tmp_ = static_cast<float>(
-      KortexMathUtil::wrapDegreesFromZeroTo360(KortexMathUtil::toDeg(arm_commands_positions_[i])));
+      KortexMathUtil::wrapDegreesFromZeroTo360(KortexMathUtil::toDeg(
+        joint_calibration_[i].raw(arm_commands_positions_[i], arm_efforts_[i]))));
     cmd_vel_tmp_ = static_cast<float>(KortexMathUtil::toDeg(arm_commands_velocities_[i]));
 
-    if (use_velocity_command_)
+    if (use_effort_command_ && torque_joints_[i])
+    {
+      // In TORQUE control mode (Kinova example 108) the position field also follows the
+      // measurement: the following error cannot trip while the torque moves the arm, but does if
+      // these commands stop arriving and the joint runs away under its last torque, which faults
+      // it into holding. A non-finite command repeats the last one; every command is rate
+      // limited and clamped (see effort_command_max_step_), then converted to kortex's sign.
+      base_command_.mutable_actuators(static_cast<int>(i))
+        ->set_position(feedback_.actuators(static_cast<int>(i)).position());
+      double effort = arm_commands_efforts_[i];
+      if (!std::isfinite(effort))
+      {
+        effort = last_effort_commands_[i];
+      }
+      effort = std::clamp(
+        effort, last_effort_commands_[i] - effort_command_max_step_,
+        last_effort_commands_[i] + effort_command_max_step_);
+      effort = std::clamp(effort, -effort_limits_[i], effort_limits_[i]);
+      last_effort_commands_[i] = effort;
+      base_command_.mutable_actuators(static_cast<int>(i))
+        ->set_torque_joint(static_cast<float>(effort_command_signs_[i] * effort));
+    }
+    else if (use_velocity_command_)
     {
       // In VELOCITY control mode the actuator tracks the velocity command (deg/s). The position
       // field is kept synced to the latest measured position so that the following error does not
@@ -1173,27 +1651,46 @@ void KortexMultiInterfaceHardware::prepareCommands()
     }
     else
     {
+      // POSITION mode; in torque mode, the joints the effort controller does not claim, holding
       base_command_.mutable_actuators(static_cast<int>(i))->set_position(cmd_degrees_tmp_);
     }
     base_command_.mutable_actuators(static_cast<int>(i))->set_command_id(base_command_.frame_id());
   }
 }
 
-void KortexMultiInterfaceHardware::setActuatorsControlMode(
-  k_api::ActuatorConfig::ControlMode control_mode)
+bool KortexMultiInterfaceHardware::setActuatorsControlMode(
+  k_api::ActuatorConfig::ControlMode control_mode, const std::vector<bool> & joints)
 {
   auto control_mode_message = k_api::ActuatorConfig::ControlModeInformation();
   control_mode_message.set_control_mode(control_mode);
+  std::string names;
   try
   {
     // Device IDs are 1-based, so actuator i maps to device id i + 1.
     for (std::size_t i = 0; i < actuator_count_; i++)
     {
+      if (!joints.empty() && !joints[i])
+      {
+        continue;
+      }
       actuator_config_.SetControlMode(control_mode_message, static_cast<uint32_t>(i + 1));
+      // Read it back: SetControlMode returning is not proof the actuator changed mode.
+      const auto actual =
+        actuator_config_.GetControlMode(static_cast<uint32_t>(i + 1)).control_mode();
+      if (actual != control_mode)
+      {
+        RCLCPP_ERROR(
+          LOGGER, "Actuator '%s' asked for %s control mode reports %s", arm_joint_names_[i].c_str(),
+          k_api::ActuatorConfig::ControlMode_Name(control_mode).c_str(),
+          k_api::ActuatorConfig::ControlMode_Name(actual).c_str());
+        return false;
+      }
+      names += (names.empty() ? "" : ", ") + arm_joint_names_[i];
     }
     RCLCPP_INFO(
-      LOGGER, "Set all actuators to %s control mode",
-      control_mode == k_api::ActuatorConfig::ControlMode::VELOCITY ? "VELOCITY" : "POSITION");
+      LOGGER, "Set actuators [%s] to %s control mode", names.c_str(),
+      k_api::ActuatorConfig::ControlMode_Name(control_mode).c_str());
+    return true;
   }
   catch (k_api::KDetailedException & ex)
   {
@@ -1206,6 +1703,176 @@ void KortexMultiInterfaceHardware::setActuatorsControlMode(
   {
     RCLCPP_ERROR_STREAM(LOGGER, "Exception while setting control mode: " << ex.what());
   }
+  return false;
+}
+
+void KortexMultiInterfaceHardware::holdMeasuredPosition()
+{
+  feedback_ = base_cyclic_.RefreshFeedback();
+  acceptBlockingFeedback();
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    const float measured = feedback_.actuators(static_cast<int>(i)).position();  // deg, raw
+    base_command_.mutable_actuators(static_cast<int>(i))->set_position(measured);
+    arm_commands_positions_[i] = calibratedPosition(feedback_, i);
+  }
+}
+
+bool KortexMultiInterfaceHardware::sendHoldFrame()
+{
+  incrementId();
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    base_command_.mutable_actuators(static_cast<int>(i))->set_command_id(base_command_.frame_id());
+  }
+  try
+  {
+    feedback_ = base_cyclic_.Refresh(base_command_);
+    acceptBlockingFeedback();
+    return true;
+  }
+  catch (std::exception & ex)
+  {
+    RCLCPP_ERROR_STREAM(LOGGER, "Could not send the hold frame: " << ex.what());
+    return false;
+  }
+}
+
+bool KortexMultiInterfaceHardware::effortSignsAgree()
+{
+  bool agree = true;
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    if (!torque_joints_[i])
+    {
+      continue;
+    }
+    if (!std::isfinite(feedback_.actuators(i).torque()) || !std::isfinite(feedback_.actuators(i).position())) {
+      RCLCPP_ERROR(LOGGER, "Non-finite TORQUE feedback");
+      return false;
+    }
+    const double commanded = last_effort_commands_[i];
+    const double measured =
+      REPORTED_TORQUE_SIGN * feedback_.actuators(static_cast<int>(i)).torque();
+    if (commanded * measured < 0.0 && std::abs(commanded - measured) > effort_check_tolerance_)
+    {
+      if (++effort_disagreement_cycles_[i] >= effort_check_cycles_)
+      {
+        RCLCPP_ERROR(
+          LOGGER,
+          "Torque sign check failed on '%s': commanded %+.2f N*m, measured %+.2f N*m for %d "
+          "cycles while holding. Wrong effort_command_signs entry for this joint?",
+          arm_joint_names_[i].c_str(), commanded, measured, effort_disagreement_cycles_[i]);
+        agree = false;
+      }
+    }
+    else
+    {
+      effort_disagreement_cycles_[i] = 0;
+    }
+  }
+  return agree;
+}
+
+bool KortexMultiInterfaceHardware::enterTorqueMode()
+{
+  // Kinova example 108, for every torque actuator: first a frame whose position is the measured
+  // one and whose torque is the one the joint carries right now, then the switch. Each actuator
+  // picks up that torque the moment it changes mode, so the arm holds until the controller's
+  // first command, which the rate limit then ramps in.
+  holdMeasuredPosition();
+  std::string names;
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    if (!torque_joints_[i])
+    {
+      continue;
+    }
+    if (!std::isfinite(feedback_.actuators(i).torque()) || !std::isfinite(feedback_.actuators(i).position())) {
+      RCLCPP_ERROR(LOGGER, "Non-finite feedback refused during TORQUE entry");
+      return false;
+    }
+    const double hold = std::clamp(
+      REPORTED_TORQUE_SIGN * feedback_.actuators(static_cast<int>(i)).torque(), -effort_limits_[i],
+      effort_limits_[i]);
+    base_command_.mutable_actuators(static_cast<int>(i))
+      ->set_torque_joint(static_cast<float>(effort_command_signs_[i] * hold));
+    arm_commands_efforts_[i] = hold;
+    last_effort_commands_[i] = hold;
+    effort_disagreement_cycles_[i] = 0;
+    names += (names.empty() ? "" : ", ") + arm_joint_names_[i] +
+             (effort_command_signs_[i] > 0 ? " (+1)" : " (-1)");
+  }
+  RCLCPP_INFO(LOGGER, "Entering torque mode on [%s]", names.c_str());
+  if (!effort_command_signs_set_)
+  {
+    RCLCPP_WARN(
+      LOGGER,
+      "effort_command_signs is not set: using +1 on every joint, from Kinova's example, NOT "
+      "measured on this arm. Run the per-joint sign test before trusting it.");
+  }
+  if (!sendHoldFrame())
+  {
+    torque_joints_.assign(actuator_count_, false);
+    return false;
+  }
+  use_effort_command_ = true;
+  if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::TORQUE, torque_joints_))
+  {
+    // Possibly half switched: put back whatever did switch.
+    leaveTorqueMode();
+    return false;
+  }
+
+  // Startup sign check, still holding and still inside the mode switch, so that a wrong command
+  // sign fails the activation instead of dropping the arm under a controller (see the header).
+  // Cannot see a joint that carries ~no torque (joint_1 on a level base, joint_6): that is what
+  // the per-joint sign test is for.
+  const auto check_end =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(effort_startup_check_ms_);
+  while (std::chrono::steady_clock::now() < check_end)
+  {
+    for (std::size_t i = 0; i < actuator_count_; i++)
+    {
+      if (torque_joints_[i])
+      {
+        base_command_.mutable_actuators(static_cast<int>(i))
+          ->set_position(feedback_.actuators(static_cast<int>(i)).position());
+      }
+    }
+    if (!sendHoldFrame() || !effortSignsAgree())
+    {
+      RCLCPP_ERROR(LOGGER, "Torque mode startup check failed: back to POSITION mode.");
+      if (!leaveTorqueMode()) throw std::runtime_error("failed to restore POSITION mode");
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+bool KortexMultiInterfaceHardware::leaveTorqueMode()
+{
+  if (soft_stop_.engaged()) {
+    // Already physically stopped. The release path verifies POSITION mode before clearing the hold.
+    use_effort_command_ = false;
+    torque_joints_.assign(actuator_count_, false);
+    return true;
+  }
+  try {
+    holdMeasuredPosition();
+    const bool frame_sent = sendHoldFrame();
+    const bool switched = setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION, torque_joints_);
+    if (frame_sent && switched) {
+      use_effort_command_ = false;
+      torque_joints_.assign(actuator_count_, false);
+      return true;
+    }
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(LOGGER, "TORQUE exit failed: %s", e.what());
+  }
+  if (applyEmergencyStop()) soft_stop_.mark_engaged();
+  return false;
 }
 
 void KortexMultiInterfaceHardware::sendJointCommands()
@@ -1218,11 +1885,11 @@ void KortexMultiInterfaceHardware::sendJointCommands()
   // send the command to the robot
   try
   {
-    feedback_ = base_cyclic_.Refresh(base_command_);
+    cyclicRefresh(true);
   }
   catch (k_api::KDetailedException & ex)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    cyclicRefresh(false);
     RCLCPP_ERROR_STREAM(LOGGER, "Kortex exception: " << ex.what());
 
     RCLCPP_ERROR_STREAM(
@@ -1231,19 +1898,65 @@ void KortexMultiInterfaceHardware::sendJointCommands()
   }
   catch (std::runtime_error & ex_runtime)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    cyclicRefresh(false);
     RCLCPP_ERROR_STREAM(LOGGER, "Runtime error: " << ex_runtime.what());
   }
   catch (std::future_error & ex_future)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    cyclicRefresh(false);
     RCLCPP_ERROR_STREAM(LOGGER, "Future error: " << ex_future.what());
   }
   catch (std::exception & ex_std)
   {
-    feedback_ = base_cyclic_.RefreshFeedback();
+    cyclicRefresh(false);
     RCLCPP_ERROR_STREAM(LOGGER, "Standard exception: " << ex_std.what());
   }
+}
+
+void KortexMultiInterfaceHardware::cyclicRefresh(bool with_command)
+{
+  if (!cyclic_async_)
+  {
+    feedback_ = with_command ? base_cyclic_.Refresh(base_command_) : base_cyclic_.RefreshFeedback();
+    acceptBlockingFeedback();
+    return;
+  }
+  // Runs on the API's receive thread. Captures replies_, not this: it may outlive the driver.
+  auto on_reply = [replies = replies_, seq = ++next_seq_](
+                    const k_api::Error & err, const k_api::BaseCyclic::Feedback & feedback)
+  {
+    if (err.error_code() != k_api::ErrorCodes::ERROR_NONE)
+    {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(replies->mutex);
+    if (seq <= replies->seq)
+    {
+      return;  // overtaken by a newer reply, or sent before a blocking refresh
+    }
+    replies->feedback = feedback;
+    replies->seq = seq;
+    replies->fresh = true;
+    replies->unanswered_since_ns = 0;
+  };
+  std::int64_t none = 0;
+  replies_->unanswered_since_ns.compare_exchange_strong(none, steadyNowNs());
+  if (with_command)
+  {
+    base_cyclic_.Refresh_callback(base_command_, on_reply);
+  }
+  else
+  {
+    base_cyclic_.RefreshFeedback_callback(on_reply);
+  }
+}
+
+void KortexMultiInterfaceHardware::acceptBlockingFeedback()
+{
+  std::lock_guard<std::mutex> lock(replies_->mutex);
+  replies_->seq = next_seq_;
+  replies_->fresh = false;
+  replies_->unanswered_since_ns = 0;
 }
 
 void KortexMultiInterfaceHardware::incrementId()
@@ -1256,7 +1969,7 @@ void KortexMultiInterfaceHardware::incrementId()
 void KortexMultiInterfaceHardware::sendGripperCommand(
   k_api::Base::ServoingMode arm_mode, double position, double velocity, double force)
 {
-  if (gripper_controller_running_ && !std::isnan(position) && has_gripper_)
+  if (gripper_controller_running_ && !std::isnan(position) && use_internal_bus_gripper_comm_)
   {
     try
     {
@@ -1297,9 +2010,15 @@ void KortexMultiInterfaceHardware::sendTwistCommand()
   k_api_twist_->set_linear_x(static_cast<float>(twist_commands_[0]));
   k_api_twist_->set_linear_y(static_cast<float>(twist_commands_[1]));
   k_api_twist_->set_linear_z(static_cast<float>(twist_commands_[2]));
-  k_api_twist_->set_angular_x(static_cast<float>(twist_commands_[3]));
-  k_api_twist_->set_angular_y(static_cast<float>(twist_commands_[4]));
-  k_api_twist_->set_angular_z(static_cast<float>(twist_commands_[5]));
+  // The Kortex API takes angular velocity in DEGREES per second, while the
+  // ros2_control twist interface is rad/s like every other ROS angular rate.
+  // Passing radians straight through makes every commanded rotation 57x too
+  // small, which presents as Cartesian rotation not working at all while
+  // translation is fine. The joint path already converts with toDeg for both
+  // position and velocity; this one was missed.
+  k_api_twist_->set_angular_x(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[3])));
+  k_api_twist_->set_angular_y(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[4])));
+  k_api_twist_->set_angular_z(static_cast<float>(KortexMathUtil::toDeg(twist_commands_[5])));
   base_.SendTwistCommand(k_api_twist_command_);
 }
 

@@ -2,16 +2,16 @@ cmake_minimum_required(VERSION 3.14)
 include(FetchContent)
 FetchContent_Declare(
   kinova_binary_api
-  URL https://artifactory.kinovaapps.com:443/artifactory/generic-public/kortex/API/2.5.0/linux_x86-64_x86_gcc.zip
-  URL_HASH MD5=64bd86e7ab8bda90ef1fc7d6a356e080
+  URL https://artifactory.kinovaapps.com:443/artifactory/generic-public/kortex/API/2.8.0/linux_x86-64_gcc_5.4.zip
+  URL_HASH MD5=b9b68885df8e1dd0e5a2ba7285f14c0d
 )
 FetchContent_MakeAvailable(kinova_binary_api)
 
 project(kortex_driver)
 
-# Default to C++14
+# The effort backend uses C++17 (std::clamp).
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -31,7 +31,7 @@ find_package(std_msgs REQUIRED)
 
 #Current: only support Linux x86_64
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-  set(API_URL https://artifactory.kinovaapps.com:443/artifactory/generic-public/kortex/API/2.5.0/linux_x86-64_x86_gcc.zip)
+  set(API_URL https://artifactory.kinovaapps.com:443/artifactory/generic-public/kortex/API/2.8.0/linux_x86-64_gcc_5.4.zip)
 else()
   # TODO(future) to support ARM or other builds logic could go here to fetch the precompiled libKortexApiCpp.a
   # see notes in kortex_api CMakeList.txt
@@ -91,6 +91,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_soft_stop test/test_soft_stop.cpp src/soft_stop.cpp)
   target_include_directories(test_soft_stop PRIVATE include)
   ament_target_dependencies(test_soft_stop rclcpp std_msgs)
+  ament_add_gtest(test_effort_interface test/test_effort_interface.cpp)
+  target_include_directories(test_effort_interface PRIVATE include)
+  target_link_libraries(test_effort_interface ${PROJECT_NAME})
+  ament_target_dependencies(test_effort_interface kortex_api hardware_interface rclcpp std_msgs)
 endif()
 
 ## EXPORTS
