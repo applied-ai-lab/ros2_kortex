@@ -881,7 +881,22 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
     }
   }
 
+  if (!faultRecoverySwitchAllowed()) return return_type::ERROR;
   return ret_val;
+}
+
+bool KortexMultiInterfaceHardware::faultRecoverySwitchAllowed() const
+{
+  if (effort_fault_latched_ && (start_joint_based_controller_ || start_twist_controller_) &&
+      (!start_joint_position_control_ ||
+       std::count(start_modes_.begin(), start_modes_.end(), StopStartInterface::START_POS_VEL) !=
+         static_cast<int>(actuator_count_)))
+  {
+    RCLCPP_ERROR(
+      LOGGER, "Torque fault recovery: switch all arm joints to POSITION before reactivating motion");
+    return false;
+  }
+  return true;
 }
 
 return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
@@ -893,6 +908,11 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     explicit WriteGuard(std::atomic<bool>& b) : blocked(b) { blocked = true; }
     ~WriteGuard() { blocked = false; }
   } write_guard(block_write);
+  // A fault/stop may arrive after prepare accepted the switch.
+  if (!faultRecoverySwitchAllowed() ||
+      (start_joint_effort_control_ &&
+       (in_fault_ != 0.0 || soft_stop_.engaged() || soft_stop_.stop_wanted())))
+    return return_type::ERROR;
   try {
 
 
@@ -932,8 +952,7 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
 
   if (start_joint_based_controller_)
   {
-    servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::LOW_LEVEL_SERVOING);
-    base_.SetServoingMode(servoing_mode_hw_);
+    setServoingMode(k_api::Base::ServoingMode::LOW_LEVEL_SERVOING);
     arm_mode_ = k_api::Base::ServoingMode::LOW_LEVEL_SERVOING;
     twist_controller_running_ = false;
     holdMeasuredPosition();
@@ -964,13 +983,13 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
       use_velocity_command_ = false;
     }
     // refresh feedback
-    feedback_ = base_cyclic_.RefreshFeedback();
-    acceptBlockingFeedback();
+    refreshFeedback();
+    if (effort_fault_latched_ && in_fault_ != 0.0)
+      throw std::runtime_error("fault still present during POSITION recovery");
   }
   if (start_twist_controller_)
   {
-    servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
-    base_.SetServoingMode(servoing_mode_hw_);
+    setServoingMode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
     arm_mode_ = k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING;
     joint_based_controller_running_ = false;
     twist_commands_ = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -988,6 +1007,8 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
 
   if (ret_val == return_type::OK && (start_joint_based_controller_ || start_twist_controller_))
     soft_stop_.on_controller_switch();
+  if (ret_val == return_type::OK && start_joint_position_control_ && !soft_stop_.holding())
+    effort_fault_latched_ = false;
   // reset auxiliary switching booleans
   stop_joint_based_controller_ = stop_twist_controller_ = stop_fault_controller_ =
     stop_gripper_controller_ = false;
@@ -1253,12 +1274,7 @@ return_type KortexMultiInterfaceHardware::read(
     return return_type::ERROR;
   }
 
-  // Whether the arm is faulted is the arm's own call (ARMSTATE_IN_FAULT), plus any live
-  // actuator fault. The base's fault banks are not part of it: they keep a fault latched after
-  // the arm has recovered and ClearFaults does not reset it (a JOINT_FAULT bit, 2026-10-14:
-  // arm state normal, every actuator clean, the Kinova's own admittance working), and counting
-  // it held every command back until a reconnect, with nothing in the log. They are logged.
-  in_fault_ = (feedback_.base().active_state() == Kinova::Api::Common::ArmState::ARMSTATE_IN_FAULT);
+  updateFaultState();
   logBankChanges();
 
   // read gripper state
@@ -1266,24 +1282,36 @@ return_type KortexMultiInterfaceHardware::read(
 
   for (std::size_t i = 0; i < actuator_count_; i++)
   {
-    // read torque
     arm_efforts_[i] = REPORTED_TORQUE_SIGN * feedback_.actuators(i).torque();  // N*m, ROS sign
-    // read velocity
     arm_velocities_[i] = KortexMathUtil::toRad(feedback_.actuators(i).velocity());  // rad/sec
-    // read position, calibrated (joint_calibration_; the raw angle when there is none)
     arm_positions_[i] = calibratedPosition(feedback_, i);  // rad
-
-    in_fault_ += (feedback_.actuators(i).fault_bank_a() + feedback_.actuators(i).fault_bank_b());
-
-    // TODO(livanov93): separate warnings into another variable to expose it via fault controller
-    //       feedback_.actuators(i).warning_bank_a() + feedback_.actuators(i).warning_bank_b());
   }
 
-
-  // add mode that can't be easily reached
-  in_fault_ += (feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY);
-
   return return_type::OK;
+}
+
+void KortexMultiInterfaceHardware::updateFaultState()
+{
+  // Whether the arm is faulted is the arm's own call (ARMSTATE_IN_FAULT), plus any live
+  // actuator fault. The base's fault banks are not part of it: they keep a fault latched after
+  // the arm has recovered and ClearFaults does not reset it (a JOINT_FAULT bit, 2026-10-14:
+  // arm state normal, every actuator clean, the Kinova's own admittance working), and counting
+  // it held every command back until a reconnect, with nothing in the log. They are logged.
+  bool fault = feedback_.base().active_state() == k_api::Common::ARMSTATE_IN_FAULT ||
+    feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY;
+  for (std::size_t i = 0; i < actuator_count_; i++)
+  {
+    fault = fault || feedback_.actuators(i).fault_bank_a() != 0 ||
+      feedback_.actuators(i).fault_bank_b() != 0;
+  }
+  in_fault_ = fault;
+  if (fault && use_effort_command_ && !effort_fault_latched_)
+  {
+    effort_fault_latched_ = true;
+    RCLCPP_WARN(
+      LOGGER, "Fault interrupted torque control. After clearing the fault, switch to POSITION, "
+      "then explicitly activate compliance again.");
+  }
 }
 
 namespace
@@ -1396,24 +1424,23 @@ return_type KortexMultiInterfaceHardware::write(
 
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_)
   {
+    // Also latch an explicit reset, even if its fault has not reached read() yet.
+    if (use_effort_command_) effort_fault_latched_ = true;
     try
     {
       // change servoing mode first
-      servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
-      base_.SetServoingMode(servoing_mode_hw_);
+      setServoingMode(k_api::Base::SINGLE_LEVEL_SERVOING);
       // apply emergency stop - twice to make it sure as calling it once appeared to be unreliable
       // (detected by testing)
-      base_.ApplyEmergencyStop(0, {false, 0, 100});
-      base_.ApplyEmergencyStop(0, {false, 0, 100});
+      if (!applyEmergencyStop()) throw std::runtime_error("failed to apply emergency stop");
       // clear faults
-      base_.ClearFaults();
+      clearFaults();
       // back to original servoing mode
       if (
         arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING ||
         arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING)
       {
-        servoing_mode_hw_.set_servoing_mode(arm_mode_);
-        base_.SetServoingMode(servoing_mode_hw_);
+        setServoingMode(arm_mode_);
       }
       // A fault clears in POSITION mode, holding. The effort controller stays active but its
       // commands are ignored until it is re-activated: torque mode is never resumed silently.
@@ -1423,7 +1450,7 @@ return_type KortexMultiInterfaceHardware::write(
         RCLCPP_WARN(
           LOGGER,
           "Fault reset left torque mode: the arm holds position. Re-activate the effort "
-          "controller to resume.");
+          "controller via POSITION to resume.");
       }
       reset_fault_async_success_ = 1.0;
     }
@@ -1441,6 +1468,26 @@ return_type KortexMultiInterfaceHardware::write(
       reset_fault_async_success_ = 0.0;
     }
     reset_fault_cmd_ = NO_CMD;
+  }
+
+  if (effort_fault_latched_)
+  {
+    // External ClearFaults (pendant/another client) must follow the same recovery policy as our
+    // reset command. Restore POSITION only once the arm permits it; ignore the old controller.
+    if (in_fault_ == 0.0 && arm_mode_ == k_api::Base::LOW_LEVEL_SERVOING &&
+        feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_LOW_LEVEL)
+    {
+      if (use_effort_command_ && !leaveTorqueMode()) return return_type::ERROR;
+      holdMeasuredPosition();
+      if (in_fault_ != 0.0) { cyclicRefresh(false); return return_type::OK; }
+      std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+      sendJointCommands();
+    }
+    else
+    {
+      cyclicRefresh(false);
+    }
+    return return_type::OK;
   }
 
   if (in_fault_ == 0.0)
@@ -1576,9 +1623,8 @@ bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
 {
   try
   {
-    servoing_mode_hw_.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
-    base_.SetServoingMode(servoing_mode_hw_);
-    base_.ClearFaults();
+    setServoingMode(k_api::Base::SINGLE_LEVEL_SERVOING);
+    clearFaults();
     if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION)) return false;
     use_effort_command_ = false;
     use_velocity_command_ = false;
@@ -1589,8 +1635,7 @@ bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
       arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING ||
       arm_mode_ == k_api::Base::ServoingMode::LOW_LEVEL_SERVOING)
     {
-      servoing_mode_hw_.set_servoing_mode(arm_mode_);
-      base_.SetServoingMode(servoing_mode_hw_);
+      setServoingMode(arm_mode_);
     }
     return true;
   }
@@ -1708,14 +1753,31 @@ bool KortexMultiInterfaceHardware::setActuatorsControlMode(
 
 void KortexMultiInterfaceHardware::holdMeasuredPosition()
 {
-  feedback_ = base_cyclic_.RefreshFeedback();
-  acceptBlockingFeedback();
+  refreshFeedback();
   for (std::size_t i = 0; i < actuator_count_; i++)
   {
     const float measured = feedback_.actuators(static_cast<int>(i)).position();  // deg, raw
     base_command_.mutable_actuators(static_cast<int>(i))->set_position(measured);
     arm_commands_positions_[i] = calibratedPosition(feedback_, i);
   }
+}
+
+void KortexMultiInterfaceHardware::refreshFeedback()
+{
+  feedback_ = base_cyclic_.RefreshFeedback();
+  acceptBlockingFeedback();
+  updateFaultState();
+}
+
+void KortexMultiInterfaceHardware::setServoingMode(k_api::Base::ServoingMode mode)
+{
+  servoing_mode_hw_.set_servoing_mode(mode);
+  base_.SetServoingMode(servoing_mode_hw_);
+}
+
+void KortexMultiInterfaceHardware::clearFaults()
+{
+  base_.ClearFaults();
 }
 
 bool KortexMultiInterfaceHardware::sendHoldFrame()
@@ -1781,6 +1843,8 @@ bool KortexMultiInterfaceHardware::enterTorqueMode()
   // picks up that torque the moment it changes mode, so the arm holds until the controller's
   // first command, which the rate limit then ramps in.
   holdMeasuredPosition();
+  if (in_fault_ != 0.0 || effort_fault_latched_ || soft_stop_.engaged() || soft_stop_.stop_wanted())
+    return false;
   std::string names;
   for (std::size_t i = 0; i < actuator_count_; i++)
   {
@@ -1860,7 +1924,25 @@ bool KortexMultiInterfaceHardware::leaveTorqueMode()
     return true;
   }
   try {
+    // A fault can first become visible in this fresh reply, after read()/prepare ran.
     holdMeasuredPosition();
+    if (effort_fault_latched_)
+    {
+      // Do not send even a single old TORQUE frame after an external fault clear. Suspend
+      // low-level servoing first, verify POSITION, seed the current pose, then restore servoing.
+      // The ordinary torque exit below primes a hold frame before changing modes; that is only
+      // appropriate for an uninterrupted, healthy controller handover.
+      setServoingMode(k_api::Base::SINGLE_LEVEL_SERVOING);
+      if (!setActuatorsControlMode(k_api::ActuatorConfig::POSITION))
+        throw std::runtime_error("failed to restore POSITION after torque fault");
+      use_effort_command_ = use_velocity_command_ = false;
+      torque_joints_.assign(actuator_count_, false);
+      holdMeasuredPosition();
+      if (in_fault_ != 0.0) throw std::runtime_error("fault still present during torque recovery");
+      setServoingMode(arm_mode_);
+      if (!sendHoldFrame()) throw std::runtime_error("failed to send recovery hold");
+      return true;
+    }
     const bool frame_sent = sendHoldFrame();
     const bool switched = setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION, torque_joints_);
     if (frame_sent && switched) {

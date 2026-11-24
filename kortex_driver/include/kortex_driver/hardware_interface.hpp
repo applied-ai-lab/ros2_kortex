@@ -250,6 +250,11 @@ private:
   // True while the actuators in torque_joints_ are in TORQUE mode and follow
   // arm_commands_efforts_. The other arm joints stay in POSITION mode, holding.
   bool use_effort_command_;
+  // A fault during torque control requires a successful explicit POSITION controller switch
+  // before torque may be activated again. ClearFaults alone must not re-arm old commands.
+  bool effort_fault_latched_ = false;
+  void updateFaultState();
+  bool faultRecoverySwitchAllowed() const;
   // Arm joint names in actuator order (info_.joints without the gripper).
   std::vector<std::string> arm_joint_names_;
   // Per arm joint (actuator order): the kinematic calibration between the arm's raw angles and
@@ -301,7 +306,7 @@ private:
   SoftStopLatch soft_stop_;
   rclcpp::SubscriptionBase::SharedPtr soft_stop_subscription_;
   void handleSoftStop();
-  bool applyEmergencyStop();
+  virtual bool applyEmergencyStop();
   bool clearFaultsAndRestoreServoing();
   bool seedArmState(const k_api::BaseCyclic::Feedback& feedback);
   friend class KortexHardwareTestAccess;
@@ -324,7 +329,12 @@ private:
   void sendTwistCommand();
   // The per-cycle exchange from write(): base_command_ and feedback (with_command) or feedback
   // only. Does not wait unless cyclic_async_ is off.
-  void cyclicRefresh(bool with_command);
+  // SDK operations are separate from controller/recovery decisions so those decisions can be
+  // exercised with a simulated transport, without connecting to a physical arm.
+  virtual void cyclicRefresh(bool with_command);
+  virtual void refreshFeedback();
+  virtual void setServoingMode(k_api::Base::ServoingMode mode);
+  virtual void clearFaults();
   // After a blocking Refresh/RefreshFeedback has set feedback_ directly: drop every reply to a
   // frame sent before it, and restart the feedback timeout.
   void acceptBlockingFeedback();
@@ -333,7 +343,7 @@ private:
   void prepareCommands();
   // Set the arm actuators (all, or those in joints) into the given control mode (POSITION,
   // VELOCITY or TORQUE). Returns false (and logs) if the robot refused it for any actuator.
-  bool setActuatorsControlMode(
+  virtual bool setActuatorsControlMode(
     k_api::ActuatorConfig::ControlMode control_mode, const std::vector<bool> & joints = {});
   // Put the torque_joints_ actuators into TORQUE mode without moving the arm, then run the
   // startup sign check (see the definition). On failure the arm is left in POSITION mode,
@@ -346,7 +356,7 @@ private:
   // Seed the position command, here and on the robot, with the measured position.
   void holdMeasuredPosition();
   // Send base_command_ once, outside the control loop, during a mode switch.
-  bool sendHoldFrame();
+  virtual bool sendHoldFrame();
   void sendGripperCommand(
     k_api::Base::ServoingMode arm_mode, double position, double velocity, double force);
 
