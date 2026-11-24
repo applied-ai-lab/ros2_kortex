@@ -215,6 +215,9 @@ private:
   };
 
   std::vector<integration_lvl_t> arm_joints_control_level_;
+  // Controller intent survives temporary POSITION holds and failed soft-stop recovery attempts.
+  integration_lvl_t joint_command_mode_ = integration_lvl_t::UNDEFINED;
+  std::vector<bool> claimed_torque_joints_;
 
   // changing active controller on the hardware
   k_api::Base::ServoingModeInformation servoing_mode_hw_;
@@ -304,6 +307,11 @@ private:
   bool use_internal_bus_gripper_comm_;
   bool has_gripper_ = false;
   SoftStopLatch soft_stop_;
+  double soft_stop_active_state_ = 0.0;
+  double soft_stop_resume_generation_ = 0.0;
+  std::vector<float> position_hold_;
+  bool position_hold_valid_ = false;
+  bool sendPositionHold();
   rclcpp::SubscriptionBase::SharedPtr soft_stop_subscription_;
   void handleSoftStop();
   virtual bool applyEmergencyStop();
@@ -348,7 +356,7 @@ private:
   // Put the torque_joints_ actuators into TORQUE mode without moving the arm, then run the
   // startup sign check (see the definition). On failure the arm is left in POSITION mode,
   // holding.
-  bool enterTorqueMode();
+  bool enterTorqueMode(bool soft_stop_recovery = false);
   // Put the torque_joints_ actuators back into POSITION mode holding where they are now.
   bool leaveTorqueMode();
   // False once a torque joint's measured effort has disagreed with its command (see above).
