@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <limits>
 #include "kortex_driver/hardware_interface.hpp"
 namespace kortex_driver {
@@ -40,6 +41,8 @@ public:
   }
   static void torqueRunning(KortexMultiInterfaceHardware& h) {
     setup(h);h.use_effort_command_=true;h.joint_based_controller_running_=true;
+    h.joint_command_mode_=KortexMultiInterfaceHardware::integration_lvl_t::EFFORT;
+    h.claimed_torque_joints_.assign(7,true);
     h.first_pass_=false;h.cyclic_async_=false;h.reset_fault_cmd_=NAN;
     h.arm_mode_=k_api::Base::LOW_LEVEL_SERVOING;
     h.feedback_.mutable_base()->set_active_state(k_api::Common::ARMSTATE_SERVOING_LOW_LEVEL);
@@ -66,7 +69,26 @@ public:
     h.arm_commands_positions_.assign(7,0);h.arm_commands_velocities_.assign(7,100);
     h.arm_commands_efforts_.assign(7,100);
   }
-  static void positionMode(KortexMultiInterfaceHardware& h){h.use_effort_command_=false;}
+  static void positionMode(KortexMultiInterfaceHardware& h){
+    h.use_effort_command_=h.use_velocity_command_=false;
+    h.joint_command_mode_=KortexMultiInterfaceHardware::integration_lvl_t::POSITION;
+  }
+  static void velocityMode(KortexMultiInterfaceHardware& h){
+    h.use_effort_command_=false;h.use_velocity_command_=true;
+    h.joint_command_mode_=KortexMultiInterfaceHardware::integration_lvl_t::VELOCITY;
+  }
+  static void targets(KortexMultiInterfaceHardware& h,double position,double velocity,double effort){
+    h.arm_commands_positions_.assign(7,position);h.arm_commands_velocities_.assign(7,velocity);
+    h.arm_commands_efforts_.assign(7,effort);
+  }
+  static void load(KortexMultiInterfaceHardware& h,double torque){
+    for(int i=0;i<7;++i)h.feedback_.mutable_actuators(i)->set_torque(torque);
+  }
+  static void shifted(KortexMultiInterfaceHardware& h){
+    for(int i=0;i<7;++i)h.feedback_.mutable_actuators(i)->set_position(220+i);
+  }
+  static bool holding(const KortexMultiInterfaceHardware& h){return h.soft_stop_.holding();}
+  static double generation(const KortexMultiInterfaceHardware& h){return h.soft_stop_resume_generation_;}
   static void reset(KortexMultiInterfaceHardware& h){h.fault_controller_running_=true;h.reset_fault_cmd_=1;}
   static bool resetSucceeded(const KortexMultiInterfaceHardware& h){return h.reset_fault_async_success_==1;}
   static k_api::BaseCyclic::Command frame(const KortexMultiInterfaceHardware& h){return h.base_command_;}
@@ -78,7 +100,8 @@ class SimulatedKortexHardware : public KortexMultiInterfaceHardware {
 public:
   SimulatedKortexHardware(){KortexHardwareTestAccess::torqueRunning(*this);}
   k_api::ActuatorConfig::ControlMode actuator_mode=k_api::ActuatorConfig::TORQUE;
-  bool fail_position=false,fail_frame=false,fault_on_refresh=false;
+  bool fail_position=false,fail_velocity=false,fail_torque=false,fail_frame=false,fault_on_refresh=false;
+  bool stop_on_mode_restore=false;
   int emergency_stops=0,clear_faults=0;
   std::vector<k_api::ActuatorConfig::ControlMode> frame_modes;
   std::vector<k_api::BaseCyclic::Command> frames;
@@ -92,11 +115,16 @@ private:
     operations.push_back(mode==k_api::Base::SINGLE_LEVEL_SERVOING ? "single" : "low");
   }
   void clearFaults() override {++clear_faults;KortexHardwareTestAccess::fault(*this,0);}
-  bool applyEmergencyStop() override {++emergency_stops;return true;}
+  bool applyEmergencyStop() override {++emergency_stops;KortexHardwareTestAccess::fault(*this,1);return true;}
   bool setActuatorsControlMode(k_api::ActuatorConfig::ControlMode mode,
     const std::vector<bool>&) override {
     if(mode==k_api::ActuatorConfig::POSITION && fail_position)return false;
-    operations.push_back(mode==k_api::ActuatorConfig::POSITION ? "position" : "torque");
+    if(mode==k_api::ActuatorConfig::VELOCITY && fail_velocity)return false;
+    if(mode==k_api::ActuatorConfig::TORQUE && fail_torque)return false;
+    if(stop_on_mode_restore && mode!=k_api::ActuatorConfig::POSITION)
+      KortexHardwareTestAccess::requestStop(*this,true);
+    operations.push_back(mode==k_api::ActuatorConfig::POSITION ? "position" :
+      mode==k_api::ActuatorConfig::VELOCITY ? "velocity" : "torque");
     actuator_mode=mode;return true;
   }
   bool sendHoldFrame() override {if(fail_frame)return false;cyclicRefresh(true);return true;}
@@ -320,4 +348,129 @@ TEST(EffortRecovery, SoftStopReleaseDoesNotClearExistingTorqueFaultLatch) {
   EXPECT_EQ(h.clear_faults,1);
   for(auto mode:h.frame_modes)EXPECT_EQ(mode,k_api::ActuatorConfig::POSITION);
 }
+
+TEST(SoftStopRecovery, VelocityResumesLatestCommandWithoutControllerSwitch) {
+  SimulatedKortexHardware h;
+  KortexHardwareTestAccess::velocityMode(h);h.actuator_mode=k_api::ActuatorConfig::VELOCITY;
+  KortexHardwareTestAccess::requestStop(h,true);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  EXPECT_TRUE(h.frames.empty());
+  KortexHardwareTestAccess::targets(h,1.2,.25,100);
+  KortexHardwareTestAccess::requestStop(h,false);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_FALSE(KortexHardwareTestAccess::holding(h));
+  EXPECT_FALSE(KortexHardwareTestAccess::stopped(h));
+  EXPECT_EQ(KortexHardwareTestAccess::generation(h),1);
+  ASSERT_FALSE(h.frames.empty());
+  EXPECT_EQ(h.frame_modes.back(),k_api::ActuatorConfig::VELOCITY);
+  EXPECT_NEAR(h.frames.back().actuators(0).velocity(),.25*180/M_PI,1e-5);
+  EXPECT_FLOAT_EQ(h.frames.back().actuators(0).torque_joint(),0);
+}
+
+TEST(SoftStopRecovery, ExportsSynchronousControllerRecoveryState) {
+  SimulatedKortexHardware h;
+  const auto states=h.export_state_interfaces();
+  const auto contains=[&](const char* name){return std::any_of(states.begin(),states.end(),
+    [&](const auto& state){return state.get_name()==name;});};
+  EXPECT_TRUE(contains("soft_stop/active"));
+  EXPECT_TRUE(contains("soft_stop/resume_generation"));
+}
+
+TEST(SoftStopRecovery, TorqueResumesFromMeasuredLoadAndSlewsNewControllerEffort) {
+  SimulatedKortexHardware h;
+  KortexHardwareTestAccess::requestStop(h,true);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  ASSERT_EQ(readFeedback(h),return_type::OK); // expected emergency-stop fault
+  EXPECT_FALSE(KortexHardwareTestAccess::latched(h));
+  KortexHardwareTestAccess::moved(h);KortexHardwareTestAccess::load(h,3);
+  KortexHardwareTestAccess::targets(h,1.2,10,100); // discarded torque from the stopped observer
+  KortexHardwareTestAccess::requestStop(h,false);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_FALSE(KortexHardwareTestAccess::holding(h));
+  EXPECT_FALSE(KortexHardwareTestAccess::latched(h));
+  EXPECT_TRUE(KortexHardwareTestAccess::effortMode(h));
+  EXPECT_EQ(KortexHardwareTestAccess::generation(h),1);
+  ASSERT_FALSE(h.frames.empty());
+  EXPECT_EQ(h.frame_modes.back(),k_api::ActuatorConfig::TORQUE);
+  EXPECT_FLOAT_EQ(h.frames.back().actuators(0).torque_joint(),-3);
+  KortexHardwareTestAccess::targets(h,1.2,0,1);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_FLOAT_EQ(h.frames.back().actuators(0).torque_joint(),-2.5);
+}
+
+TEST(SoftStopRecovery, PositionResumesLatestTargetAndClearsStaleVelocity) {
+  SimulatedKortexHardware h;
+  KortexHardwareTestAccess::positionMode(h);h.actuator_mode=k_api::ActuatorConfig::POSITION;
+  KortexHardwareTestAccess::requestStop(h,true);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  KortexHardwareTestAccess::targets(h,1.2,.25,100);
+  KortexHardwareTestAccess::requestStop(h,false);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  ASSERT_FALSE(h.frames.empty());
+  EXPECT_FALSE(KortexHardwareTestAccess::holding(h));
+  EXPECT_NEAR(h.frames.back().actuators(0).position(),1.2*180/M_PI,1e-5);
+  EXPECT_FLOAT_EQ(h.frames.back().actuators(0).velocity(),0);
+  EXPECT_FLOAT_EQ(h.frames.back().actuators(0).torque_joint(),0);
+}
+
+TEST(SoftStopRecovery, ActuatorFaultDuringStopStillRequiresExplicitRecovery) {
+  SimulatedKortexHardware h;
+  KortexHardwareTestAccess::requestStop(h,true);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  KortexHardwareTestAccess::fault(h,2);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  ASSERT_TRUE(KortexHardwareTestAccess::latched(h));
+  KortexHardwareTestAccess::requestStop(h,false);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_TRUE(KortexHardwareTestAccess::holding(h));
+  EXPECT_FALSE(KortexHardwareTestAccess::effortMode(h));
+  EXPECT_EQ(KortexHardwareTestAccess::generation(h),0);
+}
+
+TEST(EffortRecovery, PositionHoldDoesNotFollowLaterFeedbackOrControllerTargets) {
+  SimulatedKortexHardware h;
+  KortexHardwareTestAccess::fault(h,1);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  KortexHardwareTestAccess::fault(h,0);KortexHardwareTestAccess::moved(h);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  ASSERT_FALSE(h.frames.empty());
+  const auto hold=h.frames.back();
+  KortexHardwareTestAccess::targets(h,0,100,100);
+  KortexHardwareTestAccess::shifted(h);
+  KortexHardwareTestAccess::load(h,2);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  for(int joint=0;joint<7;++joint) {
+    EXPECT_FLOAT_EQ(h.frames.back().actuators(joint).position(),hold.actuators(joint).position());
+    EXPECT_FLOAT_EQ(h.frames.back().actuators(joint).velocity(),0);
+    EXPECT_FLOAT_EQ(h.frames.back().actuators(joint).torque_joint(),0);
+  }
+}
+
+class FailedSoftStopRecovery : public testing::TestWithParam<int> {};
+TEST_P(FailedSoftStopRecovery, FailedRestorationReappliesStopAndRetriesOriginalMode) {
+  SimulatedKortexHardware h;
+  const bool velocity=GetParam()==1;
+  if(velocity){KortexHardwareTestAccess::velocityMode(h);h.actuator_mode=k_api::ActuatorConfig::VELOCITY;}
+  KortexHardwareTestAccess::requestStop(h,true);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  ASSERT_EQ(readFeedback(h),return_type::OK);
+  h.fail_position=GetParam()==0;h.fail_velocity=velocity;h.fail_torque=GetParam()==2;
+  h.fail_frame=GetParam()==3;h.stop_on_mode_restore=GetParam()==4;
+  KortexHardwareTestAccess::requestStop(h,false);
+  ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_TRUE(KortexHardwareTestAccess::stopped(h));
+  EXPECT_TRUE(KortexHardwareTestAccess::holding(h));
+  EXPECT_GE(h.emergency_stops,2);
+  EXPECT_EQ(KortexHardwareTestAccess::generation(h),0);
+  h.fail_position=h.fail_velocity=h.fail_torque=h.fail_frame=h.stop_on_mode_restore=false;
+  KortexHardwareTestAccess::requestStop(h,false);
+  for(int cycle=0;cycle<102;++cycle)ASSERT_EQ(writeCommands(h),return_type::OK);
+  EXPECT_FALSE(KortexHardwareTestAccess::stopped(h));
+  EXPECT_FALSE(KortexHardwareTestAccess::holding(h));
+  EXPECT_EQ(h.actuator_mode,velocity ? k_api::ActuatorConfig::VELOCITY : k_api::ActuatorConfig::TORQUE);
+}
+INSTANTIATE_TEST_SUITE_P(PositionVelocityTorqueFrameAndRepeatedStop,FailedSoftStopRecovery,testing::Values(0,1,2,3,4));
 }

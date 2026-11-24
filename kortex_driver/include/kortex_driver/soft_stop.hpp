@@ -47,9 +47,9 @@ namespace kortex_driver
 ///   lifted.
 /// - Repeated messages (a soft stop republishing its state at 10 Hz) cause no further action.
 /// - No message ever received: nothing happens (the topic is optional and starts unknown).
-/// - After an engage, `holding()` stays true, also after release, until a controller switch: the
-///   arm keeps its measured position instead of following controller commands, so a trajectory that
-///   kept running during the stop can't make the arm jump when the stop is lifted.
+/// - `holding()` stays true throughout recovery. Once the active controller's mode is restored,
+///   mark_released(true) resumes its latest commands automatically. Independent fault recovery
+///   uses mark_released(false) to retain a fixed-position hold until a controller switch.
 /// - A failed Kortex call (`mark_failed()`) is retried after `retry_cycles` polls, not every cycle.
 /// - Watchdog (`enable_watchdog(timeout)`, then `start(now)` on activation): no message for longer
 ///   than `timeout` since the last message (or since start) counts as a stop request.
@@ -128,8 +128,13 @@ public:
     holding_ = true;
   }
 
-  /// The faults were cleared; the arm keeps holding until the next controller switch.
-  void mark_released() { engaged_ = false; }
+  /// Recovery completed. Resume only after the caller has restored the controller's mode.
+  /// Fault recovery can leave the hold in place until an explicit controller switch.
+  void mark_released(bool resume = false)
+  {
+    engaged_ = false;
+    if (resume && !stop_wanted()) holding_ = false;
+  }
 
   /// The Kortex call for the last action failed: try again after retry_cycles polls.
   void mark_failed() { backoff_ = retry_cycles_; }
