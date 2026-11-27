@@ -469,6 +469,16 @@ CallbackReturn KortexMultiInterfaceHardware::on_init(
     return CallbackReturn::ERROR;
   }
 
+  const auto hold_mode = info_.hardware_parameters.find("soft_stop_position_hold");
+  if (hold_mode != info_.hardware_parameters.end()) {
+    if (hold_mode->second != "true" && hold_mode->second != "false") {
+      RCLCPP_ERROR(LOGGER, "soft_stop_position_hold must be true or false");
+      return CallbackReturn::ERROR;
+    }
+    soft_stop_position_hold_ = hold_mode->second == "true";
+  }
+  soft_stop_positions_.resize(actuator_count_);
+
   // Optional soft stop topic (std_msgs/Bool, true = engage the arm's emergency stop, false =
   // release it). The subscription lives on this component's node, spun by the controller manager's
   // executor.
@@ -556,6 +566,10 @@ KortexMultiInterfaceHardware::export_state_interfaces()
       arm_joint_names[i], hardware_interface::HW_IF_VELOCITY, &arm_velocities_[i]));
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       arm_joint_names[i], hardware_interface::HW_IF_EFFORT, &arm_efforts_[i]));
+  }
+
+  if (soft_stop_position_hold_) {
+    state_interfaces.emplace_back("soft_stop", "holding", &soft_stop_holding_state_);
   }
 
   // state interface which reports if robot is faulted
@@ -881,6 +895,11 @@ return_type KortexMultiInterfaceHardware::prepare_command_mode_switch(
     }
   }
 
+  if (soft_stop_position_hold_ && (start_joint_based_controller_ || start_twist_controller_) &&
+      (soft_stop_.engaged() || soft_stop_.stop_wanted())) {
+    RCLCPP_ERROR(LOGGER, "Release the soft stop before activating an arm controller");
+    return return_type::ERROR;
+  }
   if (!faultRecoverySwitchAllowed()) return return_type::ERROR;
   return ret_val;
 }
@@ -909,7 +928,9 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
     ~WriteGuard() { blocked = false; }
   } write_guard(block_write);
   // A fault/stop may arrive after prepare accepted the switch.
-  if (!faultRecoverySwitchAllowed() ||
+  if ((soft_stop_position_hold_ && (start_joint_based_controller_ || start_twist_controller_) &&
+       (soft_stop_.engaged() || soft_stop_.stop_wanted())) ||
+      !faultRecoverySwitchAllowed() ||
       (start_joint_effort_control_ &&
        (in_fault_ != 0.0 || soft_stop_.engaged() || soft_stop_.stop_wanted())))
     return return_type::ERROR;
@@ -1007,8 +1028,14 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
 
   if (ret_val == return_type::OK && (start_joint_based_controller_ || start_twist_controller_))
     soft_stop_.on_controller_switch();
-  if (ret_val == return_type::OK && start_joint_position_control_ && !soft_stop_.holding())
+  if (!soft_stop_.holding()) {
+    powered_hold_active_ = false;
+    soft_stop_holding_state_ = 0.0;
+  }
+  if (ret_val == return_type::OK && start_joint_position_control_ && !soft_stop_.holding()) {
     effort_fault_latched_ = false;
+    soft_stop_hold_failed_ = false;
+  }
   // reset auxiliary switching booleans
   stop_joint_based_controller_ = stop_twist_controller_ = stop_fault_controller_ =
     stop_gripper_controller_ = false;
@@ -1305,7 +1332,7 @@ void KortexMultiInterfaceHardware::updateFaultState()
       feedback_.actuators(i).fault_bank_b() != 0;
   }
   in_fault_ = fault;
-  if (fault && use_effort_command_ && !effort_fault_latched_)
+  if (fault && (use_effort_command_ || powered_hold_active_) && !effort_fault_latched_)
   {
     effort_fault_latched_ = true;
     RCLCPP_WARN(
@@ -1407,6 +1434,10 @@ void KortexMultiInterfaceHardware::readGripperPosition()
 return_type KortexMultiInterfaceHardware::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
+  if (block_write) {
+    cyclicRefresh(false);
+    return return_type::OK;
+  }
   handleSoftStop();
   // Complete a refused reset request while stopped; do not let it execute on a later release.
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_ &&
@@ -1414,13 +1445,18 @@ return_type KortexMultiInterfaceHardware::write(
     reset_fault_async_success_ = 0.0;
     reset_fault_cmd_ = NO_CMD;
   }
-  if (soft_stop_.engaged() || soft_stop_.stop_wanted()) { cyclicRefresh(false); return return_type::OK; }
-
-  if (block_write)
-  {
+  if (soft_stop_hold_failed_ && std::isnan(reset_fault_cmd_)) {
     cyclicRefresh(false);
     return return_type::OK;
   }
+  if (powered_hold_active_) {
+    // Use the pose captured at the press, even if a controller writes another target.
+    arm_commands_positions_ = soft_stop_positions_;
+    std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+    sendJointCommands();
+    return return_type::OK;
+  }
+  if (soft_stop_.engaged() || soft_stop_.stop_wanted()) { cyclicRefresh(false); return return_type::OK; }
 
   if (!std::isnan(reset_fault_cmd_) && fault_controller_running_)
   {
@@ -1559,11 +1595,57 @@ return_type KortexMultiInterfaceHardware::write(
   return return_type::OK;
 }
 
+bool KortexMultiInterfaceHardware::enterSoftStopPositionHold()
+{
+  if (!soft_stop_position_hold_ || soft_stop_.timed_out() || in_fault_ != 0.0 ||
+      effort_fault_latched_ || !joint_based_controller_running_ ||
+      arm_mode_ != k_api::Base::LOW_LEVEL_SERVOING) return false;
+  try {
+    holdMeasuredPosition();
+    if (in_fault_ != 0.0 || effort_fault_latched_) return false;
+    if (use_effort_command_ && !sendHoldFrame()) return false;
+    if (!setActuatorsControlMode(k_api::ActuatorConfig::POSITION)) return false;
+    use_effort_command_ = false;
+    torque_joints_.assign(actuator_count_, false);
+    use_velocity_command_ = false;
+    std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+    soft_stop_positions_ = arm_commands_positions_;
+    if (!sendHoldFrame()) return false;
+    powered_hold_active_ = true;
+    return true;
+  } catch (const std::exception& ex) {
+    RCLCPP_ERROR(LOGGER, "Soft stop POSITION hold failed: %s", ex.what());
+    return false;
+  }
+}
+
 void KortexMultiInterfaceHardware::handleSoftStop()
 {
+  // A fault or lost stop heartbeat overrides the powered hold, including after release.
+  if (powered_hold_active_ && (in_fault_ != 0.0 || effort_fault_latched_ || soft_stop_.timed_out())) {
+    powered_hold_active_ = false;
+    effort_fault_latched_ = true;
+    soft_stop_holding_state_ = 1.0;
+    if (applyEmergencyStop()) soft_stop_.mark_engaged();
+    else soft_stop_.mark_failed();
+  }
   switch (soft_stop_.poll())
   {
     case SoftStopLatch::Action::Engage:
+      soft_stop_holding_state_ = 1.0;
+      if (soft_stop_position_hold_ && !soft_stop_.timed_out()) {
+        const bool held = enterSoftStopPositionHold();
+        soft_stop_.mark_engaged();
+        if (held) {
+          RCLCPP_WARN(LOGGER, "Soft stop: holding captured pose in POSITION mode");
+        } else {
+          effort_fault_latched_ = true;
+          soft_stop_hold_failed_ = true;
+          RCLCPP_ERROR(LOGGER, "Powered soft stop failed. Use the hardware hard stop. Explicit fault recovery required.");
+        }
+        break;
+      }
+      if (soft_stop_position_hold_) effort_fault_latched_ = true;
       if (applyEmergencyStop())
       {
         soft_stop_.mark_engaged();
@@ -1582,6 +1664,16 @@ void KortexMultiInterfaceHardware::handleSoftStop()
       }
       break;
     case SoftStopLatch::Action::Release:
+      if (powered_hold_active_) {
+        soft_stop_.mark_released();
+        RCLCPP_WARN(LOGGER, "Soft stop released: POSITION hold remains until controller reactivation");
+        break;
+      }
+      if (soft_stop_position_hold_ && effort_fault_latched_) {
+        soft_stop_.mark_released();
+        RCLCPP_WARN(LOGGER, "Soft stop released after a fault: explicit fault reset and POSITION recovery required");
+        break;
+      }
       if (clearFaultsAndRestoreServoing())
       {
         soft_stop_.mark_released();

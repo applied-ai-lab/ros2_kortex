@@ -32,6 +32,8 @@ soft stop published on a ROS topic, as the ROS 1 driver did with `/in/emergency_
 | `soft_stop_watchdog` | `true` | silence on the topic counts as a stop |
 | `soft_stop_timeout_s` | `0.5` | watchdog timeout [s]; the publisher must send its state more often (a heartbeat) |
 
+With the default `soft_stop_position_hold=false` setting:
+
 | message on the topic (`std_msgs/Bool`) | the driver |
 |---|---|
 | `true` (stop) | applies the arm's emergency stop (`ApplyEmergencyStop`) once |
@@ -85,3 +87,16 @@ handling, absent-gripper reads and activation-state seeding without connecting t
 `test_soft_stop` covers latch/watchdog and ROS topic behaviour. Actual SDK transitions, faults,
 communication timing and physical compliance remain commissioning checks. See the accompanying
 `compliant_controllers/docs/commissioning.md` and `docs/validation.md`.
+
+## Powered soft stop for compliant bringup
+
+FRANK compliant bringup sets `soft_stop_position_hold=true`. A button press captures
+and holds the current pose using Kinova POSITION control. Release keeps the hold until
+explicit controller reactivation. The driver exports `soft_stop/holding` so the effort
+controller can abort actions and reject new motion commands while paused.
+
+A failed hold handover is logged and latched for explicit recovery. The operator uses
+the independent hardware hard stop. The hold request itself has no automatic emergency-stop
+fallback. Existing hardware-fault and stop-heartbeat watchdog protections still apply.
+The default setting is false, preserving the existing emergency-stop topic behavior.
+This powered transition still requires verification on the robot under load.

@@ -304,6 +304,12 @@ private:
   bool use_internal_bus_gripper_comm_;
   bool has_gripper_ = false;
   SoftStopLatch soft_stop_;
+  bool soft_stop_position_hold_ = false;
+  bool powered_hold_active_ = false;
+  bool soft_stop_hold_failed_ = false;
+  double soft_stop_holding_state_ = 0.0;
+  std::vector<double> soft_stop_positions_;
+  bool enterSoftStopPositionHold();
   rclcpp::SubscriptionBase::SharedPtr soft_stop_subscription_;
   void handleSoftStop();
   virtual bool applyEmergencyStop();
