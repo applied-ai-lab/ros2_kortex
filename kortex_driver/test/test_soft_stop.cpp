@@ -88,32 +88,6 @@ TEST(SoftStopLatch, ReleaseOnceThenHoldUntilControllerSwitch)
   EXPECT_FALSE(latch.holding());
 }
 
-TEST(SoftStopLatch, SuccessfulRecoveryCanResumeImmediately)
-{
-  SoftStopLatch latch;
-  latch.request(true);
-  latch.mark_engaged();
-  latch.request(false);
-  ASSERT_EQ(latch.poll(), Action::Release);
-  latch.mark_released(true);
-  EXPECT_FALSE(latch.engaged());
-  EXPECT_FALSE(latch.holding());
-  EXPECT_EQ(latch.poll(), Action::None);
-}
-
-TEST(SoftStopLatch, AnotherStopDuringRecoveryPreventsResumption)
-{
-  SoftStopLatch latch;
-  latch.request(true);
-  latch.mark_engaged();
-  latch.request(false);
-  ASSERT_EQ(latch.poll(), Action::Release);
-  latch.request(true);
-  latch.mark_released(true);
-  EXPECT_TRUE(latch.holding());
-  EXPECT_EQ(latch.poll(), Action::Engage);
-}
-
 TEST(SoftStopLatch, SwitchWhileStopRequestedButNotYetEngagedKeepsHold)
 {
   SoftStopLatch latch;

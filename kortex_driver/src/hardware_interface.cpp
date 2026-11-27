@@ -561,10 +561,6 @@ KortexMultiInterfaceHardware::export_state_interfaces()
   // state interface which reports if robot is faulted
   state_interfaces.emplace_back(
     hardware_interface::StateInterface("reset_fault", "internal_fault", &in_fault_));
-  state_interfaces.emplace_back(
-    hardware_interface::StateInterface("soft_stop", "active", &soft_stop_active_state_));
-  state_interfaces.emplace_back(hardware_interface::StateInterface(
-    "soft_stop", "resume_generation", &soft_stop_resume_generation_));
 
   return state_interfaces;
 }
@@ -923,9 +919,6 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
   if (stop_joint_based_controller_)
   {
     joint_based_controller_running_ = false;
-    joint_command_mode_ = integration_lvl_t::UNDEFINED;
-    claimed_torque_joints_.clear();
-    position_hold_valid_ = false;
     // if the stopped controller was commanding velocities, put the actuators back into the
     // default position control mode so a following position command does not surprise the user
     if (use_velocity_command_)
@@ -939,11 +932,6 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
       if (!leaveTorqueMode()) throw std::runtime_error("failed to restore POSITION mode");
     }
     holdMeasuredPosition();
-    for (std::size_t i = 0; i < actuator_count_; ++i)
-    {
-      base_command_.mutable_actuators(static_cast<int>(i))->set_velocity(0.0);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_torque_joint(0.0);
-    }
     if (!sendHoldFrame()) throw std::runtime_error("failed to send measured-position hold");
     std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
   }
@@ -976,7 +964,6 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
       if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::VELOCITY))
         throw std::runtime_error("failed to enter VELOCITY mode");
       use_velocity_command_ = true;
-      joint_command_mode_ = integration_lvl_t::VELOCITY;
     }
     else if (start_joint_effort_control_)
     {
@@ -988,18 +975,12 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
         joint_based_controller_running_ = false;
         ret_val = hardware_interface::return_type::ERROR;
       }
-      else
-      {
-        joint_command_mode_ = integration_lvl_t::EFFORT;
-        claimed_torque_joints_ = torque_joints_;
-      }
     }
     else
     {
       if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION))
         throw std::runtime_error("failed to enter POSITION mode");
       use_velocity_command_ = false;
-      joint_command_mode_ = integration_lvl_t::POSITION;
     }
     // refresh feedback
     refreshFeedback();
@@ -1025,10 +1006,7 @@ return_type KortexMultiInterfaceHardware::perform_command_mode_switch(
   }
 
   if (ret_val == return_type::OK && (start_joint_based_controller_ || start_twist_controller_))
-  {
     soft_stop_.on_controller_switch();
-    position_hold_valid_ = false;
-  }
   if (ret_val == return_type::OK && start_joint_position_control_ && !soft_stop_.holding())
     effort_fault_latched_ = false;
   // reset auxiliary switching booleans
@@ -1097,9 +1075,6 @@ CallbackReturn KortexMultiInterfaceHardware::on_activate(
   use_effort_command_ = use_velocity_command_ = false;
   torque_joints_.assign(actuator_count_, false);
   joint_based_controller_running_ = twist_controller_running_ = false;
-  joint_command_mode_ = integration_lvl_t::UNDEFINED;
-  claimed_torque_joints_.clear();
-  position_hold_valid_ = false;
   if (soft_stop_.engaged()) soft_stop_.mark_released();
 
   // Setting the mode unconditionally matches on_init, which also ends in
@@ -1300,8 +1275,6 @@ return_type KortexMultiInterfaceHardware::read(
   }
 
   updateFaultState();
-  soft_stop_active_state_ =
-    soft_stop_.engaged() || soft_stop_.stop_wanted() || soft_stop_.holding() ? 1.0 : 0.0;
   logBankChanges();
 
   // read gripper state
@@ -1326,24 +1299,15 @@ void KortexMultiInterfaceHardware::updateFaultState()
   // it held every command back until a reconnect, with nothing in the log. They are logged.
   bool fault = feedback_.base().active_state() == k_api::Common::ARMSTATE_IN_FAULT ||
     feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_READY;
-  bool actuator_fault = false;
   for (std::size_t i = 0; i < actuator_count_; i++)
   {
-    actuator_fault = actuator_fault || feedback_.actuators(i).fault_bank_a() != 0 ||
+    fault = fault || feedback_.actuators(i).fault_bank_a() != 0 ||
       feedback_.actuators(i).fault_bank_b() != 0;
   }
-  fault = fault || actuator_fault;
   in_fault_ = fault;
-  if (fault) position_hold_valid_ = false;
-  // The base enters IN_FAULT as a direct consequence of our emergency stop. That expected
-  // state must not turn every soft stop into a separately latched torque fault. Live actuator
-  // faults, and base faults outside our stop, still require explicit POSITION recovery.
-  if (fault && (use_effort_command_ || joint_command_mode_ == integration_lvl_t::EFFORT) &&
-      !effort_fault_latched_ &&
-      (actuator_fault || !soft_stop_.engaged()))
+  if (fault && use_effort_command_ && !effort_fault_latched_)
   {
     effort_fault_latched_ = true;
-    position_hold_valid_ = false;
     RCLCPP_WARN(
       LOGGER, "Fault interrupted torque control. After clearing the fault, switch to POSITION, "
       "then explicitly activate compliance again.");
@@ -1462,7 +1426,6 @@ return_type KortexMultiInterfaceHardware::write(
   {
     // Also latch an explicit reset, even if its fault has not reached read() yet.
     if (use_effort_command_) effort_fault_latched_ = true;
-    position_hold_valid_ = false;
     try
     {
       // change servoing mode first
@@ -1515,8 +1478,10 @@ return_type KortexMultiInterfaceHardware::write(
         feedback_.base().active_state() == k_api::Common::ARMSTATE_SERVOING_LOW_LEVEL)
     {
       if (use_effort_command_ && !leaveTorqueMode()) return return_type::ERROR;
+      holdMeasuredPosition();
       if (in_fault_ != 0.0) { cyclicRefresh(false); return return_type::OK; }
-      if (!sendPositionHold()) return return_type::ERROR;
+      std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+      sendJointCommands();
     }
     else
     {
@@ -1557,19 +1522,20 @@ return_type KortexMultiInterfaceHardware::write(
       sendGripperCommand(
         arm_mode_, gripper_command_position_, gripper_speed_command_, gripper_force_command_);
 
-      if (soft_stop_.holding())
+      if (joint_based_controller_running_)
       {
-        if (!sendPositionHold()) return return_type::ERROR;
-      }
-      else if (joint_based_controller_running_)
-      {
+        if (soft_stop_.holding()) {
+          if (use_effort_command_ && !leaveTorqueMode()) return return_type::ERROR;
+          holdMeasuredPosition();
+          std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
+        }
         // send commands to the joints
         sendJointCommands();
       }
       else
       {
         // Keep alive mode - no controller active
-        if (!sendPositionHold()) return return_type::ERROR;
+        cyclicRefresh(false);
         // RCLCPP_DEBUG(LOGGER, "No controller active in LOW_LEVEL_SERVOING mode !");
       }
     }
@@ -1601,8 +1567,6 @@ void KortexMultiInterfaceHardware::handleSoftStop()
       if (applyEmergencyStop())
       {
         soft_stop_.mark_engaged();
-        position_hold_valid_ = false;
-        soft_stop_active_state_ = 1.0;
         if (soft_stop_.timed_out())
         {
           RCLCPP_ERROR(LOGGER, "Soft stop watchdog: no message in time, emergency stop applied");
@@ -1620,17 +1584,10 @@ void KortexMultiInterfaceHardware::handleSoftStop()
     case SoftStopLatch::Action::Release:
       if (clearFaultsAndRestoreServoing())
       {
-        soft_stop_.mark_released(!effort_fault_latched_);
-        soft_stop_active_state_ = soft_stop_.holding() || soft_stop_.stop_wanted() ? 1.0 : 0.0;
-        if (!soft_stop_.holding())
-        {
-          ++soft_stop_resume_generation_;
-          RCLCPP_WARN(LOGGER, "Soft stop released: restored the active controller; resuming its latest target");
-        }
-        else
-        {
-          RCLCPP_WARN(LOGGER, "Soft stop released: independent torque fault still requires POSITION recovery");
-        }
+        soft_stop_.mark_released();
+        RCLCPP_WARN(
+          LOGGER,
+          "Soft stop released: faults cleared; the arm holds until a controller is (re)activated");
       }
       else
       {
@@ -1664,30 +1621,15 @@ bool KortexMultiInterfaceHardware::applyEmergencyStop()
 
 bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
 {
-  // Preserve controller targets: recovery frames and torque-entry seeding must not replace the
-  // target a still-active controller produced during the stop. Torque itself is reseeded below.
-  const auto positions = arm_commands_positions_;
-  const auto velocities = arm_commands_velocities_;
   try
   {
     setServoingMode(k_api::Base::SINGLE_LEVEL_SERVOING);
     clearFaults();
-    if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION))
-      throw std::runtime_error("failed to restore POSITION mode");
+    if (!setActuatorsControlMode(k_api::ActuatorConfig::ControlMode::POSITION)) return false;
     use_effort_command_ = false;
     use_velocity_command_ = false;
     torque_joints_.assign(actuator_count_, false);
     holdMeasuredPosition();
-    position_hold_.clear();
-    for (std::size_t i = 0; i < actuator_count_; ++i)
-    {
-      const float measured = feedback_.actuators(static_cast<int>(i)).position();
-      if (!std::isfinite(measured)) throw std::runtime_error("non-finite recovery position");
-      position_hold_.push_back(measured);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_velocity(0.0);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_torque_joint(0.0);
-    }
-    position_hold_valid_ = true;
     std::fill(arm_commands_velocities_.begin(), arm_commands_velocities_.end(), 0.0);
     if (
       arm_mode_ == k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING ||
@@ -1695,55 +1637,16 @@ bool KortexMultiInterfaceHardware::clearFaultsAndRestoreServoing()
     {
       setServoingMode(arm_mode_);
     }
-    refreshFeedback();
-    if (in_fault_ != 0.0 || soft_stop_.stop_wanted())
-      throw std::runtime_error("fault or another stop during recovery");
-    if (arm_mode_ == k_api::Base::LOW_LEVEL_SERVOING)
-    {
-      if (feedback_.base().active_state() != k_api::Common::ARMSTATE_SERVOING_LOW_LEVEL)
-        throw std::runtime_error("low-level servoing not ready after recovery");
-      if (!sendHoldFrame()) throw std::runtime_error("failed to send recovery hold");
-      if (joint_based_controller_running_ && !effort_fault_latched_)
-      {
-        if (joint_command_mode_ == integration_lvl_t::VELOCITY)
-        {
-          if (!setActuatorsControlMode(k_api::ActuatorConfig::VELOCITY))
-            throw std::runtime_error("failed to restore VELOCITY mode");
-          use_velocity_command_ = true;
-        }
-        else if (joint_command_mode_ == integration_lvl_t::EFFORT)
-        {
-          torque_joints_ = claimed_torque_joints_;
-          if (torque_joints_.size() != actuator_count_)
-            throw std::runtime_error("missing torque controller ownership during recovery");
-          if (!enterTorqueMode(true)) throw std::runtime_error("failed to restore TORQUE mode");
-          refreshFeedback();
-          if (in_fault_ != 0.0) throw std::runtime_error("fault during TORQUE recovery");
-        }
-      }
-    }
-    if (soft_stop_.stop_wanted()) throw std::runtime_error("another stop during recovery");
-    arm_commands_positions_ = positions;
-    arm_commands_velocities_ = velocities;
     return true;
   }
   catch (k_api::KDetailedException & ex)
   {
     RCLCPP_ERROR_STREAM(LOGGER, "Soft stop: clearing faults failed: " << ex.what());
   }
-  catch (const std::exception & ex)
-  {
-    RCLCPP_ERROR(LOGGER, "Soft stop recovery failed: %s", ex.what());
-  }
   catch (...)
   {
     RCLCPP_ERROR(LOGGER, "Soft stop: clearing faults failed");
   }
-  // ClearFaults may already have succeeded before a later recovery step failed. Reapply the
-  // physical stop; keeping only the software latch engaged would leave a partially restored arm.
-  applyEmergencyStop();
-  arm_commands_positions_ = positions;
-  arm_commands_velocities_ = velocities;
   return false;
 }
 
@@ -1790,14 +1693,11 @@ void KortexMultiInterfaceHardware::prepareCommands()
       base_command_.mutable_actuators(static_cast<int>(i))
         ->set_position(feedback_.actuators(static_cast<int>(i)).position());
       base_command_.mutable_actuators(static_cast<int>(i))->set_velocity(cmd_vel_tmp_);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_torque_joint(0.0);
     }
     else
     {
       // POSITION mode; in torque mode, the joints the effort controller does not claim, holding
       base_command_.mutable_actuators(static_cast<int>(i))->set_position(cmd_degrees_tmp_);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_velocity(0.0);
-      base_command_.mutable_actuators(static_cast<int>(i))->set_torque_joint(0.0);
     }
     base_command_.mutable_actuators(static_cast<int>(i))->set_command_id(base_command_.frame_id());
   }
@@ -1859,43 +1759,6 @@ void KortexMultiInterfaceHardware::holdMeasuredPosition()
     const float measured = feedback_.actuators(static_cast<int>(i)).position();  // deg, raw
     base_command_.mutable_actuators(static_cast<int>(i))->set_position(measured);
     arm_commands_positions_[i] = calibratedPosition(feedback_, i);
-  }
-}
-
-bool KortexMultiInterfaceHardware::sendPositionHold()
-{
-  try
-  {
-    if (!position_hold_valid_)
-    {
-      refreshFeedback();
-      if (in_fault_ != 0.0) return false;
-      position_hold_.clear();
-      for (std::size_t i = 0; i < actuator_count_; ++i)
-      {
-        const float position = feedback_.actuators(static_cast<int>(i)).position();
-        if (!std::isfinite(position)) throw std::runtime_error("non-finite hold position");
-        position_hold_.push_back(position);
-      }
-      position_hold_valid_ = true;
-    }
-    incrementId();
-    for (std::size_t i = 0; i < actuator_count_; ++i)
-    {
-      auto * command = base_command_.mutable_actuators(static_cast<int>(i));
-      command->set_position(position_hold_[i]);
-      command->set_velocity(0.0);
-      command->set_torque_joint(0.0);
-      command->set_command_id(base_command_.frame_id());
-    }
-    cyclicRefresh(true);
-    return true;
-  }
-  catch (const std::exception & ex)
-  {
-    RCLCPP_ERROR(LOGGER, "Position hold failed: %s", ex.what());
-    if (applyEmergencyStop()) soft_stop_.mark_engaged();
-    return false;
   }
 }
 
@@ -1973,15 +1836,14 @@ bool KortexMultiInterfaceHardware::effortSignsAgree()
   return agree;
 }
 
-bool KortexMultiInterfaceHardware::enterTorqueMode(bool soft_stop_recovery)
+bool KortexMultiInterfaceHardware::enterTorqueMode()
 {
   // Kinova example 108, for every torque actuator: first a frame whose position is the measured
   // one and whose torque is the one the joint carries right now, then the switch. Each actuator
   // picks up that torque the moment it changes mode, so the arm holds until the controller's
   // first command, which the rate limit then ramps in.
   holdMeasuredPosition();
-  if (in_fault_ != 0.0 || effort_fault_latched_ ||
-      (soft_stop_.engaged() && !soft_stop_recovery) || soft_stop_.stop_wanted())
+  if (in_fault_ != 0.0 || effort_fault_latched_ || soft_stop_.engaged() || soft_stop_.stop_wanted())
     return false;
   std::string names;
   for (std::size_t i = 0; i < actuator_count_; i++)
@@ -2034,7 +1896,6 @@ bool KortexMultiInterfaceHardware::enterTorqueMode(bool soft_stop_recovery)
     std::chrono::steady_clock::now() + std::chrono::milliseconds(effort_startup_check_ms_);
   while (std::chrono::steady_clock::now() < check_end)
   {
-    if (soft_stop_.stop_wanted()) throw std::runtime_error("soft stop during torque startup");
     for (std::size_t i = 0; i < actuator_count_; i++)
     {
       if (torque_joints_[i])
