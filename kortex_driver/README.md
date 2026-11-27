@@ -56,7 +56,7 @@ soft stop published on a ROS topic, as the ROS 1 driver did with `/in/emergency_
   publisher must therefore republish its state periodically: a heartbeat (Frank's soft stop publishes every
   0.1 s, so 0.5 s tolerates four lost messages). When messages resume with `false`, the stop is released as
   above (faults cleared, arm holds until a controller switch). With the watchdog off, silence does nothing.
-# FRANK TORQUE trial integration
+# FRANK TORQUE control
 
 Branch `ros2-compliant` combines FRANK's `frank` driver at
 `495ed5a4ebadda9dff997c92d828d60cf6373d50` with the effort implementation from
@@ -69,6 +69,10 @@ prepare calls do not block writes. Joint and Cartesian command modes exclude one
 FRANK effort mode requires all arm joints together. Reactivation reseeds measured pose/torque
 after manual repositioning. An engaged soft stop rejects torque entry and fault reset; release
 holds POSITION until an arm controller is explicitly reactivated.
+
+Hardware testing of the earlier automatic-resume code showed the arm dropping during
+the stop and snapping back on release. That code has been reverted. Post-revert
+stop/release behavior still needs confirmation on the robot.
 
 SDK headers and static library both use **2.8.0** on Linux amd64. Commands are total torque in
 ROS joint signs and N·m; gravity belongs to `compliant_controllers`, not this driver. Each command
