@@ -23,6 +23,9 @@
     gripper_joint_name
     gripper_max_velocity:=100.0
     gripper_max_force:=100.0
+    effort_command_signs:=''
+    joint_offsets:=${dict()}
+    joint_compliance:=${dict()}
     use_fake_hardware:=false
     fake_sensor_commands:=false
     sim_gazebo:=false
@@ -55,6 +58,9 @@
       use_internal_bus_gripper_comm="${use_internal_bus_gripper_comm}"
       gripper_max_velocity="${gripper_max_velocity}"
       gripper_max_force="${gripper_max_force}"
+      effort_command_signs="${effort_command_signs}"
+      joint_offsets="${joint_offsets}"
+      joint_compliance="${joint_compliance}"
       gripper_joint_name="${gripper_joint_name}"
       gripper="${gripper}"/>
 
